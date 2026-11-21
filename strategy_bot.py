@@ -3,6 +3,7 @@ from dataclasses import dataclass
 import math
 
 from arena_geometry import Arena
+from ground_navigation import GroundNavigation
 import mechfight as mf
 
 
@@ -72,15 +73,11 @@ class Bot:
     def __init__(self, hello: mf.Hello, practice=PRACTICE, free_for_all=FREE_FOR_ALL):
         self.config = hello["config"]
         self.arena = Arena(hello["map"]["dir"])
+        self.navigation = GroundNavigation(self.arena, self.config["mech"])
         self.practice, self.free_for_all = practice, free_for_all
         match = self.config["match"]
         self.physics_step = 1 / match["tick_hz"]
         self.turn_step = match["decide_every"] * self.physics_step
-        self.alive = match["mechs"]
-        self.starting_alive = self.alive
-        self.first_shrink = self.config["zone"]["phases"][0]["hold_s"]
-        self.kills = set()
-        self.other_fight_until = {}
         self.last_combat = -math.inf
         self.last_damage_bearing = None
         self.last_damage = -math.inf
@@ -97,41 +94,15 @@ class Bot:
         self.roof_deadline = -math.inf
         self.roof_retry = -math.inf
 
-    def update_situation(self, obs, enemies):
+    def update_situation(self, obs):
         now = obs["t"]
         for event in obs["events"]:
             kind = event["type"]
-            if kind in ("damaged", "hit"):
-                self.last_combat = now
-            if kind == "kill":
-                self.kills.add(event["target"])
+            if kind in ("damaged", "hit", "kill"):
                 self.last_combat = now
             if kind == "damaged" and event["bearing"] is not None:
                 self.last_damage_bearing = event["bearing"]
                 self.last_damage = now
-        # Zone deaths can also happen in practice, so use early deaths only.
-        if (obs["alive"] < self.alive and now < self.first_shrink
-                and self.starting_alive - obs["alive"] > len(self.kills)):
-            self.pvp = True
-        self.alive = obs["alive"]
-        own = obs["self"]["pos"]
-        for beam in obs["beams"]:
-            source = beam["by"]
-            for point in beam["path"][1:]:
-                # A beam ending near us is ambiguous even when another mech is nearby.
-                if distance(point, own) < obs["self"]["stats"]["radius"] + 6:
-                    continue
-                for enemy in enemies:
-                    if enemy["id"] == source:
-                        continue
-                    pos = enemy["pos"]
-                    size = 1 + self.config["cubes"]["size_per_cube"] * enemy.get("cubes", 0)
-                    stats = self.config["mech"]
-                    if (distance(point, pos) <= stats["radius"] * size + 1
-                            and pos[2] - 1 <= point[2] <= pos[2] + stats["height"] * size + 1):
-                        self.pvp = True
-                        self.other_fight_until[enemy["id"]] = now + 3
-                        self.other_fight_until[source] = now + 3
 
     def aim(self, me, target, weapon):
         kind, stats = weapon["kind"], weapon["stats"]
@@ -224,8 +195,8 @@ class Bot:
                      and weapon.get("ammo", 1) > 0)
             if kind == "laser":
                 charging = weapon.get("charge", 0)
-                trigger = ready and (charging < stats["charge"] - self.physics_step / 2
-                                     or (not aligned and charging < stats["charge"] + 0.2))
+                # An absent shot solution leaves the trigger released even while charging.
+                trigger = ready and charging < stats["charge"] - 1e-6
                 priority = 100 if charging else 56
             elif kind == "lightning":
                 trigger = ready and aligned
@@ -343,7 +314,7 @@ class Bot:
                 return False
         return True
 
-    def move(self, me, goal, action, dodge, hurry, quiet, cover_from=None):
+    def move(self, me, goal, action, dodge, hurry, quiet, cover_from=None, close_threat=False):
         d = distance(me["pos"], goal)
         if dodge is None and d < 2:
             return
@@ -355,6 +326,8 @@ class Bot:
         if quiet:
             magnitude = min(magnitude, 0.94 * self.config["sound"]["step_speed"] / stats["walk_speed"])
         horizon = max(4, stats["walk_speed"] * magnitude * 0.38 + stats["radius"])
+        if dodge is None:
+            horizon = min(horizon, d)
         offsets = (0, 30, -30, 63, -63, 100, -100, 150, -150)
         best_yaw = None
         for offset in offsets:
@@ -376,7 +349,9 @@ class Bot:
             action["boost"] = not me["grounded"] and me["energy"] > 30
             return
         action["move"] = [math.cos(best_yaw) * magnitude, math.sin(best_yaw) * magnitude]
-        action["boost"] = (hurry or dodge is not None) and me["grounded"] and me["energy"] > 24
+        remaining = me["energy"] - stats["boost_drain"] * self.turn_step
+        reserve = 24 if close_threat else 65
+        action["boost"] = (hurry or dodge is not None) and me["grounded"] and remaining >= reserve
 
     def roof_escape(self, obs, enemies, action, enabled, urgent_zone):
         now, me = obs["t"], obs["self"]
@@ -411,19 +386,22 @@ class Bot:
         roof = self.roof
         if self.roof_phase == "approach":
             gap = distance(pos, roof.launch)
-            if gap > 2:
-                self.move(me, roof.launch, action, None, False, False)
-                if gap < 7 and "move" in action:
-                    action["move"] = [component * 0.45 for component in action["move"]]
+            if gap > 0.55:
+                if gap > 7:
+                    self.move(me, roof.launch, action, None, False, False)
+                else:
+                    yaw = bearing(pos, roof.launch)
+                    speed = min(0.35, gap / 8)
+                    action["move"] = [math.cos(yaw) * speed, math.sin(yaw) * speed]
                 return True
-            if math.hypot(*me["vel"][:2]) > 2.5:
+            if math.hypot(*me["vel"][:2]) > 1:
                 action["move"] = [0, 0]
                 return True
             if not me["grounded"] or me["energy"] < roof.energy - 2:
                 self.roof = None
                 return False
             self.roof_phase = "climb"
-        if self.roof_phase == "climb" and pos[2] < roof.top + 0.8:
+        if self.roof_phase == "climb" and pos[2] <= roof.top + 0.5:
             if me["energy"] < 8:
                 self.roof = None
                 return False
@@ -435,7 +413,7 @@ class Bot:
             self.roof = None
             self.roof_retry = now + 5
             return False
-        if pos[2] < roof.top - 0.5 or (me["energy"] < 2 and pos[2] < roof.top + 0.8):
+        if pos[2] < roof.top - 0.5 or (me["energy"] < 2 and pos[2] <= roof.top + 0.5):
             self.roof = None
             return False
         dx, dy = roof.landing[0] - roof.launch[0], roof.landing[1] - roof.launch[1]
@@ -486,7 +464,7 @@ class Bot:
         options = []
         if needs_weapon:
             for pickup in pickups:
-                bonus = {"laser": 12, "lightning": 7, "mortar": 4}.get(pickup["kind"])
+                bonus = {"laser": 36, "lightning": 32, "mortar": 0}.get(pickup["kind"])
                 if bonus is not None:
                     options.append((pickup["pos"], 99 + bonus, 105))
         if needs_cubes:
@@ -545,7 +523,7 @@ class Bot:
         now = obs["t"]
         enemies = sorted((a for a in obs["mechs"] if a["kind"] == "mech"),
                          key=lambda a: distance(pos, a["pos"]))
-        self.update_situation(obs, enemies)
+        self.update_situation(obs)
         hp = me["hp"] / me["max_hp"]
         tactics = self.free_for_all if self.pvp else self.practice
         if hp < tactics.retreat_hp:
@@ -565,8 +543,7 @@ class Bot:
             distance(pos, a["pos"]) + 75 * a.get("hp", 1400) / a.get("max_hp", 1400)
         )) if not self.pvp or distance(pos, e["pos"]) < 40
             or (recently_hit and abs(angle_error(bearing(pos, e["pos"]), self.last_damage_bearing)) < 0.5)
-            or e.get("hp", math.inf) < 0.26 * e.get("max_hp", 1400)
-            or self.other_fight_until.get(e["id"], -1) > now), None)
+            or e.get("hp", math.inf) < 0.26 * e.get("max_hp", 1400)), None)
         if disengage:
             # Only shoot through recovery when a close attacker can still hit us.
             target = None
@@ -649,8 +626,10 @@ class Bot:
         if climbing:
             target = None
         else:
+            if dodge is None:
+                goal = self.navigation.waypoint(me, goal, now)
             self.move(me, goal, action, dodge, urgent_zone or (disengage and near_dist < 95),
-                      quiet and dodge is None and not urgent_zone, cover_from)
+                      quiet and dodge is None and not urgent_zone, cover_from, near_dist < 20)
 
         if threat_bearing is None:
             self.scan = math.remainder(self.scan + 0.055, math.tau)

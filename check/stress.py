@@ -68,7 +68,6 @@ def main():
         obs = cases[frame % len(cases)]
         obs.update(t=10 + frame * 0.1, tick=200 + 2 * frame)
         # Revisit all decision paths independently of health hysteresis in earlier cases.
-        bot.pvp = frame % 5 == 0
         bot.recovering = False
         bot.roof = None
         bot.roof_retry = -math.inf

@@ -5,8 +5,10 @@ import json
 from pathlib import Path
 import unittest
 from unittest.mock import patch
+from types import SimpleNamespace
 
 from arena_geometry import Prism, RoofEntry
+from ground_navigation import GroundGrid
 from strategy_bot import Bot, PRACTICE, intercept
 
 
@@ -33,15 +35,16 @@ class StrategyTests(unittest.TestCase):
         self.assertAlmostEqual(intercept((100, 0, 0), (10, 0, 0), 100, 4), 96 / 90)
         self.assertIsNone(intercept((100, 0, 0), (110, 0, 0), 100))
 
-    def test_only_unexplained_early_death_changes_mode(self):
+    def test_early_deaths_and_beams_do_not_change_practice_mode(self):
         bot = Bot(self.hello)
         obs = deepcopy(self.replay[0])
-        obs.update(alive=15, t=10, events=[{"type": "kill", "target": 8}], beams=[])
-        bot.update_situation(obs, [])
+        x, y, z = obs["self"]["pos"]
+        target = [x - 65, y, z]
+        obs.update(alive=13, t=20, events=[],
+                   mechs=[{"id": 12, "kind": "mech", "pos": target, "aim": [0, 0]}],
+                   beams=[{"by": 11, "kind": "laser", "path": [[x, y, z], target], "age": 0}])
+        bot.act(obs)
         self.assertFalse(bot.pvp)
-        obs.update(alive=14, t=20, events=[])
-        bot.update_situation(obs, [])
-        self.assertTrue(bot.pvp)
 
     def test_projectile_approach_and_height(self):
         bot = Bot(self.hello)
@@ -99,6 +102,56 @@ class StrategyTests(unittest.TestCase):
             bot.attack(me, {}, action)
         self.assertEqual(action["fire"], [True, False])
 
+    def test_laser_releases_at_full_charge_and_when_target_disappears(self):
+        bot = Bot(self.hello)
+        me = deepcopy(self.replay[0]["self"])
+        stats = self.hello["config"]["weapons"]["laser"]
+        laser = {"kind": "laser", "stats": stats, "cooldown": 0, "charge": stats["charge"]}
+        me["weapons"] = [None, laser]
+        me["aim"] = [0, 0]
+        action = {}
+        with patch.object(bot, "aim", return_value=(0.2, 0, 0.03, 0.05)):
+            bot.attack(me, {}, action)
+            self.assertEqual(action["fire"], [False, False])
+            laser["charge"] = stats["charge"] / 2
+            bot.attack(me, {}, action)
+            self.assertEqual(action["fire"], [False, True])
+        with patch.object(bot, "aim", return_value=None):
+            bot.attack(me, {}, action)
+            self.assertEqual(action["fire"], [False, False])
+
+    def test_ground_boost_reserves_energy_except_at_close_range(self):
+        bot = Bot(self.hello)
+        me = deepcopy(self.replay[0]["self"])
+        me["energy"] = 66
+        action = {}
+        with patch.object(bot.arena, "walkable", return_value=True):
+            bot.move(me, (0, 0), action, None, True, False)
+            self.assertFalse(action["boost"])
+            bot.move(me, (0, 0), action, None, True, False, close_threat=True)
+            self.assertTrue(action["boost"])
+            me["energy"] = 70
+            bot.move(me, (0, 0), action, None, True, False)
+            self.assertTrue(action["boost"])
+
+    def test_astar_routes_out_of_a_u_shaped_wall(self):
+        def wall(left, bottom, right, top):
+            return Prism({"base": 0, "top": 15, "holes": [],
+                          "ring": [left, bottom, right, bottom, right, top, left, top]})
+
+        arena = SimpleNamespace(
+            bounds={"minX": -64, "maxX": 64, "minY": -64, "maxY": 64},
+            ground=lambda x, y: 0,
+            prisms=[wall(-14, -14, -10, 28), wall(10, -14, 14, 28), wall(-14, -14, 14, -10)],
+        )
+        grid = GroundGrid(arena, self.hello["config"]["mech"])
+        start, finish = (0, 0), (0, -32)
+        self.assertFalse(grid.straight(start, finish))
+        route = grid.route(grid.nearest(start), grid.nearest(finish))
+        self.assertEqual(route[-1], finish)
+        self.assertGreater(max(point[1] for point in route), 28)
+        self.assertTrue(all(grid.straight(a, b) for a, b in zip([start, *route], route)))
+
     def test_recovery_holds_cover_but_still_respects_zone(self):
         bot = Bot(self.hello)
         obs = deepcopy(self.replay[0])
@@ -129,12 +182,22 @@ class StrategyTests(unittest.TestCase):
         obs.update(mechs=[enemy], pickups=[pickup], cubes=[], drops=[], projectiles=[])
         with (patch.object(bot.arena, "solid_between", return_value=False),
               patch.object(bot.arena, "walkable", return_value=True),
+              patch.object(bot.navigation, "waypoint", side_effect=lambda me, goal, now: goal),
               patch.object(bot, "aim", return_value=(0, 0, 0.04, 0.04))):
             action = bot.act(obs)
             self.assertGreater(action["move"][1], 0.99)
             self.assertEqual(action["fire"], [True, False])
             enemy["pos"] = [x, y + 65, z]
             self.assertIsNone(bot.resource_goal(obs, [pickup], [enemy]))
+
+    def test_resource_route_prefers_laser_or_lightning_to_mortar(self):
+        bot = Bot(self.hello)
+        obs = deepcopy(self.replay[0])
+        x, y, z = obs["self"]["pos"]
+        mortar = {"kind": "mortar", "pos": [x, y + 20, z]}
+        lightning = {"kind": "lightning", "pos": [x, y + 48, z]}
+        with patch.object(bot.arena, "solid_between", return_value=False):
+            self.assertEqual(bot.resource_goal(obs, [mortar, lightning], []), tuple(lightning["pos"][:2]))
 
     def test_scout_keeps_waypoint_while_torso_scans(self):
         bot = Bot(self.hello)
@@ -159,10 +222,10 @@ class StrategyTests(unittest.TestCase):
     def test_roof_geometry_finds_clear_entry_and_respects_energy(self):
         bot = Bot(self.hello)
         me = deepcopy(self.replay[0]["self"])
-        me["pos"] = [-240, -125, bot.arena.ground(-240, -125)]
+        me["pos"] = [-115, -90, bot.arena.ground(-115, -90)]
         roofs = list(bot.arena.roof_entries(me))
         self.assertTrue(roofs)
-        self.assertLess(roofs[0].top - me["pos"][2], 40)
+        self.assertLessEqual(roofs[0].top - me["pos"][2], 22)
         self.assertLess(roofs[0].energy, me["energy"])
         me["energy"] = 15
         self.assertFalse(list(bot.arena.roof_entries(me)))
@@ -179,7 +242,7 @@ class StrategyTests(unittest.TestCase):
               patch.object(bot.arena, "solid_between", return_value=True)):
             self.assertTrue(bot.roof_escape(obs, enemies, action, True, False))
         self.assertTrue(action["jump"])
-        me.update(pos=[0, 0, 7], grounded=False)
+        me.update(pos=[0, 0, 15.5], grounded=False)
         action.clear()
         self.assertTrue(bot.roof_escape(obs, enemies, action, True, False))
         self.assertTrue(action["boost"])

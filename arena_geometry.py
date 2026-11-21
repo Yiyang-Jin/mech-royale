@@ -103,8 +103,10 @@ class Arena:
         if sys.byteorder != "little":
             self.heights.byteswap()
         self.bins = defaultdict(list)
+        self.prisms = []
         for data in world["prisms"]:
             prism = Prism(data)
+            self.prisms.append(prism)
             for cell in cells(*prism.bounds):
                 self.bins[cell].append(prism)
 
@@ -142,12 +144,13 @@ class Arena:
         stats = me["stats"]
         radius = stats["radius"]
         offset = radius + 3.25
+        launch_offset = max(3.2, radius + 0.7)
         footprint = ((0, 0), (radius, 0), (-radius, 0), (0, radius), (0, -radius))
         nearby = {p for cell in cells(x - reach, y - reach, x + reach, y + reach)
                   for p in self.bins.get(cell, ())}
         edges = []
         for prism in nearby:
-            if prism.kind != "building" or not 8 <= prism.top - z <= 40:
+            if prism.kind not in ("building", "bridge") or not 6 <= prism.top - z <= 22:
                 continue
             for (ax, ay), (bx, by) in pairwise(prism.rings[0]):
                 dx, dy = bx - ax, by - ay
@@ -160,7 +163,7 @@ class Arena:
                 nx, ny = -dy / length, dx / length
                 if not prism.inside(px + nx, py + ny):
                     nx, ny = -nx, -ny
-                launch = px - nx * offset, py - ny * offset
+                launch = px - nx * launch_offset, py - ny * launch_offset
                 gap = math.dist((x, y), launch)
                 if gap <= reach and not prism.inside(*launch):
                     edges.append((gap, launch, (px, py), (nx, ny), prism))
@@ -169,7 +172,7 @@ class Arena:
             lx, ly = launch
             lz = self.ground(lx, ly)
             rise = prism.top - lz
-            if not 8 <= rise <= 40 or (gap > 2 and not self.walkable(
+            if not 6 <= rise <= 22 or (gap > 2 and not self.walkable(
                 me, math.atan2(ly - y, lx - x), gap
             )):
                 continue
