@@ -5,3 +5,8 @@
 !canary_path.py
 !canary_bot.py
 !probe_bot.py
+!practice_bot.py
+!v2/
+v2/*
+!v2/core.cpp
+!v2/native.py

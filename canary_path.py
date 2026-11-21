@@ -22,8 +22,9 @@ def edge_clear(x, y, prism, radius):
 
 
 class StaticRoutes:
-    def __init__(self, arena, stats):
+    def __init__(self, arena, stats, timed_search=True):
         self.arena = arena
+        self.timed_search = timed_search
         border = stats["radius"] + 0.85
         self.x0 = math.ceil((arena.bounds["minX"] + border) / STEP) * STEP
         self.y0 = math.ceil((arena.bounds["minY"] + border) / STEP) * STEP
@@ -155,7 +156,7 @@ class StaticRoutes:
             if node == end:
                 break
             expanded += 1
-            if expanded % 16 == 0 and perf_counter() >= deadline:
+            if self.timed_search and expanded % 16 == 0 and perf_counter() >= deadline:
                 break
             for other, weight in self.edges[node]:
                 next_cost = walked + weight
