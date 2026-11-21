@@ -82,6 +82,10 @@ class Bot:
         self.pvp = False
         self.recovering = False
         self.scan = hello["slot"] * math.tau / match["mechs"]
+        self.sound_bearing = None
+        self.sound_until = -math.inf
+        self.velocity_tracks = {}
+        self.velocity_time = -math.inf
         self.scout_waypoint = None
         self.scout_until = -math.inf
         self.scout_turn = 0
@@ -102,9 +106,7 @@ class Bot:
                 self.last_damage_bearing = event["bearing"]
                 self.last_damage = now
 
-    def aim(self, me, target, weapon):
-        kind, stats = weapon["kind"], weapon["stats"]
-        target_pos = target["pos"]
+    def target_dimensions(self, target):
         target_kind = target.get("kind", "crate")
         if target_kind == "mech":
             size = 1 + self.config["cubes"]["size_per_cube"] * target.get("cubes", 0)
@@ -112,15 +114,43 @@ class Bot:
         else:
             size = 1
             dimensions = self.config["npc" if target_kind == "npc" else "crates"]
+        return dimensions["radius"] * size, dimensions["height"] * size
+
+    def observe_velocity(self, now, enemies):
+        previous = self.velocity_tracks if now - self.velocity_time <= 0.3 else {}
+        self.velocity_time = now
+        self.velocity_tracks = {}
+        for enemy in enemies:
+            velocity = enemy.get("vel", (0, 0, 0))
+            last = previous.get(enemy["id"])
+            # Reset on a reversal instead of leading in the old direction.
+            if last is not None and sum(a * b for a, b in zip(last[:2], velocity[:2])) > 0:
+                velocity = tuple(0.7 * a + 0.3 * b for a, b in zip(last, velocity))
+            self.velocity_tracks[enemy["id"]] = velocity
+
+    def sound_direction(self, obs):
+        now = obs["t"]
+        priority = {"laser_charge": 4, "gun": 3, "boost": 2, "step": 1}
+        near = [s for s in obs["sounds"] if s["dist"] == "near" and s["kind"] in priority and s["age"] <= 0.65]
+        if near:
+            sound = max(near, key=lambda s: (priority[s["kind"]], -s["age"]))
+            self.sound_bearing = sound["bearing"]
+            self.sound_until = now + 0.8 - sound["age"]
+        return self.sound_bearing if now <= self.sound_until else None
+
+    def aim(self, me, target, weapon):
+        kind, stats = weapon["kind"], weapon["stats"]
+        target_pos = target["pos"]
+        target_radius, target_height = self.target_dimensions(target)
         x, y, z = me["pos"]
         muzzle = z + (me["stats"]["height"] + 0.5 if kind == "mortar"
                       else me["stats"]["muzzle_height"])
         start = x, y, muzzle
-        target_height = dimensions["height"] * size
         aim_height = min(0.8, target_height / 2) if kind == "mortar" else target_height / 2
         offset = target_pos[0] - x, target_pos[1] - y, target_pos[2] + aim_height - muzzle
         velocity = target.get("vel", (0, 0, 0))
         if kind == "gun":
+            velocity = self.velocity_tracks.get(target.get("id"), velocity)
             flight = intercept(offset, velocity, stats["speed"], me["stats"]["radius"] + 0.5)
             if flight is None:
                 return None
@@ -160,11 +190,47 @@ class Bot:
             if not self.arena.clear_shot(previous, point):
                 return None
             previous = point
-        yaw_margin = min(0.22, math.atan2(dimensions["radius"] * size * 0.85, max(1, horizontal)))
+        yaw_margin = min(0.22, math.atan2(target_radius * 0.85, max(1, horizontal)))
         pitch_margin = min(0.22, math.atan2(target_height * 0.38, max(1, math.hypot(horizontal, dz))))
         if kind == "mortar":
             pitch_margin = min(pitch_margin, yaw_margin)
         return yaw, pitch, yaw_margin, pitch_margin
+
+    def actual_ray_hits(self, me, target, weapon):
+        gun = weapon["kind"] == "gun"
+        stats = weapon["stats"]
+        speed = stats["speed"] if gun else 1.0
+        target_vel = self.velocity_tracks.get(target.get("id"), target.get("vel", (0, 0, 0))) if gun else (0, 0, 0)
+        x, y, z = me["pos"]
+        muzzle = x, y, z + me["stats"]["muzzle_height"]
+        yaw, pitch = me["aim"]
+        unit = math.cos(pitch) * math.cos(yaw), math.cos(pitch) * math.sin(yaw), math.sin(pitch)
+        barrel = me["stats"]["radius"] + 0.5
+        origin = tuple(start + barrel * axis for start, axis in zip(muzzle, unit))
+        px, py, pz = (start - feet for start, feet in zip(origin, target["pos"]))
+        vx, vy, vz = (speed * axis - move for axis, move in zip(unit, target_vel))
+        radius, height = self.target_dimensions(target)
+        a = vx * vx + vy * vy
+        b = px * vx + py * vy
+        c = px * px + py * py - radius * radius
+        lo, hi = 0.0, stats["range"] / speed
+        if a > 1e-9:
+            disc = b * b - a * c
+            if disc < 0:
+                return False
+            root = math.sqrt(disc)
+            lo, hi = max(lo, (-b - root) / a), min(hi, (-b + root) / a)
+        elif c > 0:
+            return False
+        if abs(vz) > 1e-9:
+            enter, leave = sorted((-pz / vz, (height - pz) / vz))
+            lo, hi = max(lo, enter), min(hi, leave)
+        elif not 0 <= pz <= height:
+            return False
+        if lo > hi:
+            return False
+        hit = tuple(start + speed * axis * lo for start, axis in zip(origin, unit))
+        return self.arena.clear_shot(muzzle, hit)
 
     def attack(self, me, target, action):
         fire = [False, False]
@@ -189,12 +255,16 @@ class Bot:
             yaw_error = abs(angle_error(desired_yaw, yaw))
             pitch_error = abs(desired_pitch - pitch)
             aligned = yaw_error <= yaw_margin and pitch_error <= pitch_margin
+            if aligned and kind in ("gun", "laser"):
+                aligned = self.actual_ray_hits(me, target, weapon)
             ready = (weapon["cooldown"] <= self.turn_step and not weapon.get("reload", 0)
                      and weapon.get("ammo", 1) > 0)
             if kind == "laser":
                 charging = weapon.get("charge", 0)
-                trigger = ready and (charging < stats["charge"] - self.physics_step / 2
-                                     or (not aligned and charging < stats["charge"] + 0.2))
+                trigger = ready and ((charging == 0 and aligned) or (charging > 0 and (
+                    charging < stats["charge"] - self.physics_step / 2
+                    or (not aligned and charging < stats["charge"] + 0.2)
+                )))
                 priority = 100 if charging else 56
             elif kind == "lightning":
                 trigger = ready and aligned
@@ -515,6 +585,7 @@ class Bot:
         enemies = sorted((a for a in obs["mechs"] if a["kind"] == "mech"),
                          key=lambda a: distance(pos, a["pos"]))
         self.update_situation(obs)
+        self.observe_velocity(now, enemies)
         hp = me["hp"] / me["max_hp"]
         tactics = self.free_for_all if self.pvp else self.practice
         if hp < tactics.retreat_hp:
@@ -622,10 +693,12 @@ class Bot:
 
         if threat_bearing is None:
             self.scan = math.remainder(self.scan + 0.055, math.tau)
-            sounds = [s for s in obs["sounds"] if s["dist"] == "near"
-                      and s["kind"] in ("gun", "laser_charge", "lightning", "boost")]
-            look = sounds[0]["bearing"] if sounds else self.scan
+            sound = self.sound_direction(obs)
+            look = self.scan if sound is None else sound
+            if sound is not None:
+                target = None
         else:
+            self.sound_until = -math.inf
             look = threat_bearing
         action["aim"] = [look, 0.0]
         self.attack(me, target, action)

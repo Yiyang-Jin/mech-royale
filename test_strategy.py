@@ -66,7 +66,8 @@ class StrategyTests(unittest.TestCase):
         me["weapons"][1] = {"kind": "lightning", "stats": stats, "cooldown": 0}
         me["aim"] = [0, 0]
         action = {}
-        with patch.object(bot, "aim", return_value=(0, 0, 0.04, 0.08)):
+        with (patch.object(bot, "aim", return_value=(0, 0, 0.04, 0.08)),
+              patch.object(bot, "actual_ray_hits", return_value=True)):
             bot.attack(me, {}, action)
             self.assertEqual(action["fire"], [True, True])
             me["energy"] = stats["energy"] - 1
@@ -80,7 +81,8 @@ class StrategyTests(unittest.TestCase):
         me["weapons"][1] = {"kind": "mortar", "stats": mortar, "cooldown": 0}
         me["aim"] = [0, 0.03]
         action = {}
-        with patch.object(bot, "aim", side_effect=[(0, 0, 0.04, 0.04), (0, 0.06, 0.04, 0.04)]):
+        with (patch.object(bot, "aim", side_effect=[(0, 0, 0.04, 0.04), (0, 0.06, 0.04, 0.04)]),
+              patch.object(bot, "actual_ray_hits", return_value=True)):
             bot.attack(me, {}, action)
         self.assertEqual(action["aim"], [0, 0.06])
         self.assertEqual(action["fire"], [False, True])
@@ -92,9 +94,36 @@ class StrategyTests(unittest.TestCase):
         me["weapons"][1] = {"kind": "laser", "stats": laser, "cooldown": 0, "charge": laser["charge"]}
         me["aim"] = [0, 0]
         action = {}
-        with patch.object(bot, "aim", return_value=(0, 0, 0.04, 0.08)):
+        with (patch.object(bot, "aim", return_value=(0, 0, 0.04, 0.08)),
+              patch.object(bot, "actual_ray_hits", return_value=True)):
             bot.attack(me, {}, action)
         self.assertEqual(action["fire"], [True, False])
+
+    def test_actual_gun_ray_accounts_for_moving_cylinder_and_cover(self):
+        bot = Bot(self.hello)
+        me = deepcopy(self.replay[0]["self"])
+        me.update(pos=[0, 0, 0], vel=[0, 18, 0], aim=[0, 0])
+        gun = me["weapons"][0]
+        enemy = {"id": 12, "kind": "mech", "pos": [100, 0, 0], "vel": [0, 15, 0]}
+        with patch.object(bot.arena, "clear_shot", return_value=True):
+            self.assertFalse(bot.actual_ray_hits(me, enemy, gun))
+            me["aim"] = list(bot.aim(me, enemy, gun)[:2])
+            self.assertTrue(bot.actual_ray_hits(me, enemy, gun))
+            me["vel"] = [0, -18, 0]
+            self.assertTrue(bot.actual_ray_hits(me, enemy, gun))
+        with patch.object(bot.arena, "clear_shot", return_value=False):
+            self.assertFalse(bot.actual_ray_hits(me, enemy, gun))
+
+    def test_near_laser_charge_wins_sound_priority_and_persists(self):
+        bot = Bot(self.hello)
+        obs = deepcopy(self.replay[0])
+        obs.update(mechs=[], sounds=[
+            {"kind": "step", "dist": "near", "bearing": 0.2, "age": 0},
+            {"kind": "laser_charge", "dist": "near", "bearing": 2.1, "age": 0.1},
+        ])
+        self.assertEqual(bot.act(obs)["aim"], [2.1, 0])
+        obs.update(t=0.5, sounds=[])
+        self.assertEqual(bot.act(obs)["aim"], [2.1, 0])
 
     def test_recovery_holds_cover_but_still_respects_zone(self):
         bot = Bot(self.hello)
@@ -126,6 +155,7 @@ class StrategyTests(unittest.TestCase):
         obs.update(mechs=[enemy], pickups=[pickup], cubes=[], drops=[], projectiles=[])
         with (patch.object(bot.arena, "solid_between", return_value=False),
               patch.object(bot.arena, "walkable", return_value=True),
+              patch.object(bot, "actual_ray_hits", return_value=True),
               patch.object(bot, "aim", return_value=(0, 0, 0.04, 0.04))):
             action = bot.act(obs)
             self.assertGreater(action["move"][1], 0.99)
