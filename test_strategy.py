@@ -7,7 +7,7 @@ from pathlib import Path
 import unittest
 from unittest.mock import patch
 
-from arena_geometry import Prism, RoofEntry
+from arena_geometry import Prism, RoofEntry, cells
 from strategy_bot import Bot, PRACTICE, intercept
 
 
@@ -295,7 +295,7 @@ class StrategyTests(unittest.TestCase):
         me.update(pos=[19, 0, 15], grounded=True)
         self.assertFalse(bot.roof_escape(obs, enemies, {}, True, False))
 
-    def test_close_but_occluded_enemy_does_not_break_recovery(self):
+    def test_enemy_within_16_metres_prevents_cover_hold(self):
         bot = Bot(self.hello)
         obs = deepcopy(self.replay[0])
         me = obs["self"]
@@ -307,6 +307,29 @@ class StrategyTests(unittest.TestCase):
             action = bot.act(obs)
         self.assertIsNotNone(attack.call_args.args[1])
         self.assertEqual(action["fire"], [False, False])
+
+    def test_blocked_enemy_at_38_metres_keeps_pillar_step_silent(self):
+        bot = Bot(self.hello)
+        obs = deepcopy(self.replay[0])
+        me = obs["self"]
+        me.update(hp=me["max_hp"] * 0.4, pos=[-15, 5, 0], grounded=True, energy=100)
+        obs["zone"].update(center=[0, 0], next_center=[0, 0], radius=400, next_radius=320)
+        enemy = {"id": 12, "kind": "mech", "pos": [23, 4, 0], "aim": [0, 0]}
+        prism = Prism({"kind": "building", "base": -1, "top": 18,
+                       "ring": [-8, -9, 8, -9, 8, 9, -8, 9], "holes": []})
+        bins = {cell: [prism] for cell in cells(*prism.bounds)}
+        obs.update(t=95, drops=[], projectiles=[], beams=[], sounds=[], mechs=[enemy],
+                   events=[{"type": "damaged", "bearing": 0}])
+        bot.uncovered_since = 90
+        with (patch.object(bot.arena, "bins", bins),
+              patch.object(bot.arena, "ground", return_value=0),
+              patch.object(bot, "attack", wraps=bot.attack) as attack):
+            action = bot.act(obs)
+        self.assertIsNone(bot.uncovered_since)
+        self.assertIsNone(attack.call_args.args[1])
+        self.assertEqual(action["fire"], [False, False])
+        self.assertFalse(action["boost"])
+        self.assertLess(action["move"][1], -0.8)
 
     def test_full_laser_waits_for_visible_ray_but_releases_after_grace_or_near_lightning(self):
         bot = Bot(self.hello)
@@ -527,6 +550,7 @@ class StrategyTests(unittest.TestCase):
         foe = {"id": 12, "kind": "mech", "pos": [x + 60, y, z], "hp": 1000, "aim": [0, 0]}
         obs.update(t=95, drops=[], projectiles=[], beams=[], sounds=[], events=[], mechs=[foe])
         with (patch.object(bot, "covered_for_recovery", return_value=False),
+              patch.object(bot, "recovery_exposed", return_value=True),
               patch.object(bot, "recovery_cover", return_value=(x - 22, y)) as cover,
               patch.object(bot.arena, "walkable", return_value=True)):
             bot.act(obs)
@@ -540,6 +564,23 @@ class StrategyTests(unittest.TestCase):
             self.assertFalse(action["boost"])
             self.assertGreater(abs(action["move"][1]), 0.9)
             cover.assert_called_once()
+
+    def test_stalled_recovery_counterattack_uses_exposed_pursuer(self):
+        bot = Bot(self.hello)
+        obs = deepcopy(self.replay[0])
+        x, y, z = obs["self"]["pos"]
+        obs["self"].update(hp=500, energy=60, grounded=True)
+        obs["zone"].update(center=[x, y], next_center=[x, y], radius=400, next_radius=320)
+        blocked = {"id": 12, "kind": "mech", "pos": [x + 30, y, z], "hp": 200, "aim": [0, 0]}
+        exposed = {"id": 13, "kind": "mech", "pos": [x, y + 40, z], "hp": 1000, "aim": [0, 0]}
+        obs.update(t=95, drops=[], projectiles=[], beams=[], sounds=[], events=[], mechs=[blocked, exposed])
+        bot.uncovered_since = 92
+        with (patch.object(bot, "recovery_exposed", side_effect=lambda me, e: e is exposed),
+              patch.object(bot.arena, "walkable", return_value=True),
+              patch.object(bot, "attack") as attack):
+            action = bot.act(obs)
+        self.assertIs(attack.call_args.args[1], exposed)
+        self.assertGreater(abs(action["move"][0]), 0.9)
 
     def test_drop_route_and_armor_pick_continue_when_aim_follows_sound(self):
         bot = Bot(self.hello)

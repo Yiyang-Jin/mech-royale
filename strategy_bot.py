@@ -3,7 +3,7 @@ from dataclasses import dataclass
 import math
 from time import perf_counter
 
-from arena_geometry import Arena
+from arena_geometry import Arena, cells
 import mechfight as mf
 
 
@@ -16,7 +16,6 @@ class Tactics:
     mortar_distance: float
     lightning_distance: float
     kite_band: float = 14
-    cover_hold_distance: float = 50
 
 
 @dataclass(frozen=True)
@@ -489,19 +488,69 @@ class Bot:
         yaw = facing + side * (1 - correction) * math.pi / 2
         return pos[0] + 32 * math.cos(yaw), pos[1] + 32 * math.sin(yaw)
 
-    def covered_for_recovery(self, me, enemies, tactics):
+    def recovery_sightlines(self, me, enemy):
         pos = me["pos"]
-        eye = (*pos[:2], pos[2] + me["stats"]["eye_height"])
-        muzzle = self.config["mech"]["muzzle_height"]
-        for enemy in enemies:
-            ex, ey, ez = enemy["pos"]
-            if (distance(pos, enemy["pos"]) < tactics.cover_hold_distance
-                    and pos[2] - ez < 8):
-                return False
-            scale = 1 + self.config["cubes"]["size_per_cube"] * enemy.get("cubes", 0)
-            if not self.arena.solid_between((ex, ey, ez + muzzle * scale), eye):
-                return False
-        return True
+        return (
+            (self.mech_point(enemy, self.config["mech"][height]),
+             (*pos[:2], pos[2] + me["stats"][height]))
+            for height in ("muzzle_height", "eye_height")
+        )
+
+    def recovery_exposed(self, me, enemy):
+        return any(not self.arena.solid_between(start, end)
+                   for start, end in self.recovery_sightlines(me, enemy))
+
+    def covered_for_recovery(self, me, enemies):
+        return all(distance(me["pos"], enemy["pos"]) > 16 and not self.recovery_exposed(me, enemy)
+                   for enemy in enemies)
+
+    def pillar_goal(self, obs, enemies):
+        me = obs["self"]
+        pos = me["pos"]
+        pursuers = [e for e in enemies if distance(pos, e["pos"]) <= 80]
+        if not pursuers:
+            return None
+        start, end = next(self.recovery_sightlines(me, pursuers[0]))
+        nearby = dict.fromkeys(p for cell in cells(min(start[0], end[0]), min(start[1], end[1]),
+                                                  max(start[0], end[0]), max(start[1], end[1]))
+                               for p in self.arena.bins.get(cell, ()))
+        pillars = []
+        for prism in nearby:
+            if prism.kind in ("building", "bridge") and prism.intersects(start, end):
+                left, bottom, right, top = prism.bounds
+                center = ((left + right) / 2, (bottom + top) / 2)
+                pillars.append((distance(pos, center), center, prism))
+        if not pillars:
+            return None
+        _, center, pillar = min(pillars, key=lambda item: item[0])
+        centroid = tuple(sum(e["pos"][i] for e in pursuers) / len(pursuers) for i in range(2))
+        if distance(center, centroid) < 1 or distance(center, pos) < 1:
+            return None
+        away = bearing(centroid, center)
+        radial = bearing(center, pos)
+        error = angle_error(away, radial)
+        if abs(error) <= 0.12:
+            return None
+        tangent = radial + math.copysign(math.pi / 2, error)
+        safe_goal, best_error = None, abs(error) - 0.03
+        for offset in (0, 30, -30, 60, -60):
+            yaw = tangent + math.radians(offset)
+            dx, dy = math.cos(yaw), math.sin(yaw)
+            point = (pos[0] + dx * 6, pos[1] + dy * 6)
+            gap = abs(angle_error(away, bearing(center, point)))
+            if (gap >= best_error or distance(point, self.safe_destination(obs, point)) > 0.1
+                    or not self.arena.walkable(me, yaw, 6)):
+                continue
+            for x, y in ((pos[0] + dx * 3, pos[1] + dy * 3), point):
+                z = self.arena.ground(x, y)
+                next_me = dict(me, pos=(x, y, z))
+                if (abs(z - pos[2]) > me["stats"]["step_up"]
+                        or not all(pillar.intersects(a, b) for a, b in self.recovery_sightlines(next_me, pursuers[0]))
+                        or not self.covered_for_recovery(next_me, enemies)):
+                    break
+            else:
+                safe_goal, best_error = point, gap
+        return safe_goal
 
     def move(self, me, goal, action, dodge, hurry, quiet, cover_from=None):
         d = distance(me["pos"], goal)
@@ -1041,8 +1090,8 @@ class Bot:
             or e.get("hp", math.inf) < 0.26 * e.get("max_hp", 1400)
             or self.other_fight_until.get(e["id"], -1) > now]
         target = self.select_target(me, candidates)
-        recover_covered = (self.recovering and me["grounded"] and not recently_hit
-                           and self.covered_for_recovery(me, enemies, tactics))
+        recover_covered = (self.recovering and me["grounded"]
+                           and self.covered_for_recovery(me, enemies))
         if recover_covered:
             target = None
         if not self.recovering or recover_covered:
@@ -1050,9 +1099,11 @@ class Bot:
         elif self.uncovered_since is None:
             self.uncovered_since = now
         recovery_stalled = self.uncovered_since is not None and now - self.uncovered_since >= 2.5
-        fight_close = recovery_stalled and near_dist <= 45
-        if fight_close and (target is None or distance(pos, target["pos"]) > 45):
-            target = self.select_target(me, [e for e in enemies if distance(pos, e["pos"]) <= 45])
+        exposed_close = [e for e in enemies if distance(pos, e["pos"]) <= 45 and self.recovery_exposed(me, e)
+                         ] if recovery_stalled else []
+        fight_close = bool(exposed_close)
+        if fight_close and target not in exposed_close:
+            target = self.select_target(me, exposed_close)
         execute = (not self.recovering or recovery_stalled) and self.can_execute(me, target, enemies)
         quick_finish = (execute and target.get("hp", math.inf) < 350
                         and distance(pos, target["pos"]) < 70 and self.arena.clear_shot(
@@ -1080,6 +1131,7 @@ class Bot:
         peek_plan = None
         corner = None
         recovery_route = None
+        pillar_step = None
         supply = None
         cube_reach = self.cube_reach(me, 42)
         kill_cubes = [cube for cube in obs["cubes"] if now < self.collect_until and near_dist >= 45
@@ -1105,7 +1157,8 @@ class Bot:
                         corner = self.corner_position(obs, target, others, weapon)
                 peek_plan = self.cover_peek(obs, target, others, corner)
             if recover_covered:
-                goal = zone_goal
+                pillar_step = self.pillar_goal(obs, enemies)
+                goal = pillar_step if pillar_step is not None else zone_goal
             elif fight_close:
                 yaw = bearing(pos, target["pos"]) + self.weave_side(now) * math.pi / 2
                 goal = (pos[0] + 24 * math.cos(yaw), pos[1] + 24 * math.sin(yaw))
@@ -1218,8 +1271,13 @@ class Bot:
             cover_from = (tx, ty, tz + self.config["mech"]["muzzle_height"])
         escaping = disengage and not (peek_plan or corner or fight_close
                                        or (recovery_stalled and target is not None and recovery_route is None))
-        self.move(me, goal, action, dodge, urgent_zone or (escaping and near_dist < 95),
-                  quiet and dodge is None and not urgent_zone, cover_from if escaping else None)
+        if pillar_step is not None and dodge is None:
+            yaw = bearing(pos, goal)
+            action["move"] = [math.cos(yaw), math.sin(yaw)]
+            action["boost"] = False
+        else:
+            self.move(me, goal, action, dodge, urgent_zone or (escaping and near_dist < 95),
+                      quiet and dodge is None and not urgent_zone, cover_from if escaping else None)
         boost_route = ((developing and distance(pos, goal) > 9)
                        or (execute and not urgent_zone and distance(pos, target["pos"]) > 50)
                        or (supply is not None and supply[1] is None and distance(pos, goal) > 24))
