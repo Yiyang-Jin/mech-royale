@@ -292,6 +292,48 @@ class StrategyTests(unittest.TestCase):
         self.assertLess(bot.kite_goal(me, target, PRACTICE)[0], 0)
         self.assertFalse(bot.can_execute(me, target, [target, {"id": 13, "pos": [90, 0, 0], "hp": 900}]))
 
+    def test_cover_peek_precharges_then_crosses_and_returns(self):
+        bot = Bot(self.hello)
+        obs = deepcopy(self.replay[0])
+        me = obs["self"]
+        x, y, z = me["pos"]
+        weapon = {"kind": "laser", "stats": self.hello["config"]["weapons"]["laser"],
+                  "charge": 0, "cooldown": 0}
+        me["weapons"] = [None, weapon]
+        target = {"id": 12, "kind": "mech", "pos": [x + 105, y, z]}
+        with (patch.object(bot.arena, "solid_between", return_value=True),
+              patch.object(bot.arena, "ground", return_value=z),
+              patch.object(bot.arena, "walkable", return_value=True),
+              patch.object(bot, "aim", return_value=(0, 0, 0.03, 0.03))):
+            start = bot.cover_peek(obs, target)
+        self.assertEqual(start[0], (x, y))
+        with patch.object(bot, "aim", return_value=None):
+            action = {}
+            bot.attack(me, target, action)
+            self.assertTrue(action["fire"][1])
+        obs["t"] = 0.4
+        weapon["charge"] = 0.4
+        exposed = bot.cover_peek(obs, target)[0]
+        self.assertNotEqual(exposed, (x, y))
+        me["pos"] = [*exposed, z]
+        obs["t"] = 1.4
+        weapon["charge"] = 0
+        weapon["cooldown"] = 1.65
+        self.assertEqual(bot.cover_peek(obs, target)[0], (x, y))
+
+    def test_supply_eight_second_window_and_single_enemy_guard(self):
+        bot = Bot(self.hello)
+        obs = deepcopy(self.replay[0])
+        x, y, z = obs["self"]["pos"]
+        drop = {"id": 20, "pos": [x + 50, y, z], "radius": 8, "lands_in": 8, "holder": None}
+        obs["drops"] = [drop]
+        self.assertIsNone(bot.choose_supply(obs, []))
+        drop["lands_in"] = 7.9
+        self.assertEqual(bot.choose_supply(obs, []), (drop, None))
+        foe = {"id": 12, "pos": drop["pos"]}
+        self.assertEqual(bot.choose_supply(obs, [foe]), (drop, foe))
+        self.assertIsNone(bot.choose_supply(obs, [foe, {"id": 13, "pos": [x + 55, y, z]}]))
+
     def test_recorded_observations_without_wrapper_fallback(self):
         bot = Bot(self.hello)
         for obs in self.replay:

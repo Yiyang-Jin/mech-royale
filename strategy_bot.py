@@ -33,6 +33,17 @@ class Shot:
                 and abs(self.pitch - pitch) <= self.pitch_margin)
 
 
+@dataclass
+class Peek:
+    target: int
+    cover: tuple[float, float]
+    exposed: tuple[float, float]
+    aim: tuple[float, float]
+    began: float
+    saw_charge: bool = False
+    returning: bool = False
+
+
 PRACTICE = Tactics(0.56, 0.88, 72, 115, 82, 29)
 FREE_FOR_ALL = Tactics(0.66, 0.88, 88, 135, 98, 32)
 
@@ -90,6 +101,8 @@ class Bot:
         self.collect_until = -math.inf
         self.laser_full_since = None
         self.laser_unsafe = False
+        self.peek = None
+        self.peek_precharge = False
         self.scan = hello["slot"] * math.tau / match["mechs"]
         self.scout_waypoint = None
         self.scout_until = -math.inf
@@ -266,6 +279,8 @@ class Bot:
                     continue
             solution = self.aim(me, target, weapon)
             if solution is None:
+                if kind == "laser" and ready and charge == 0 and self.peek_precharge:
+                    fire[slot] = True
                 continue
             desired_yaw, desired_pitch, yaw_margin, pitch_margin = solution
             if kind == "lightning":
@@ -620,10 +635,81 @@ class Bot:
             for enemy in enemies
         )
 
+    def choose_supply(self, obs, enemies):
+        pos = obs["self"]["pos"]
+        if sum(distance(pos, e["pos"]) < 40 for e in enemies) > 1:
+            return None
+        for drop in sorted(obs["drops"], key=lambda d: distance(pos, d["pos"])):
+            gap = distance(pos, drop["pos"])
+            if drop["lands_in"] >= 8 or gap >= 180:
+                continue
+            center = drop["pos"][:2]
+            if distance(center, self.safe_destination(obs, center)) >= drop["radius"] - 1:
+                continue
+            nearby = [e for e in enemies if distance(center, e["pos"]) < 40]
+            if len(nearby) > 1:
+                continue
+            contest = next((e for e in nearby if distance(center, e["pos"]) <= drop["radius"]
+                            or e["id"] == drop["holder"]), None)
+            return drop, contest
+        return None
+
+    def cover_peek(self, obs, target):
+        me, now = obs["self"], obs["t"]
+        pos = me["pos"]
+        laser = next((w for w in me["weapons"] if w and w["kind"] == "laser"), None)
+        if (laser is None or target is None or self.laser_unsafe or not me["grounded"]
+                or not 70 < distance(pos, target["pos"]) < 180):
+            return None
+        if self.peek is not None and self.peek.target != target["id"]:
+            self.peek = None
+        if self.peek is None:
+            if laser["cooldown"] > self.turn_step or laser.get("charge", 0) > 0:
+                return None
+            x, y, z = pos
+            tx, ty, tz = target["pos"]
+            eye = z + me["stats"]["muzzle_height"]
+            if not self.arena.solid_between((x, y, eye), (tx, ty, tz + 4.5)):
+                return None
+            toward = bearing(pos, target["pos"])
+            for gap in (5, 8):
+                for side in (self.turn_side, -self.turn_side):
+                    yaw = toward + side * math.pi / 2
+                    if not self.arena.walkable(me, yaw, gap):
+                        continue
+                    ex, ey = x + gap * math.cos(yaw), y + gap * math.sin(yaw)
+                    if distance((ex, ey), self.safe_destination(obs, (ex, ey))) > 1:
+                        continue
+                    ground = self.arena.ground(ex, ey)
+                    if abs(ground - z) > me["stats"]["step_up"]:
+                        continue
+                    solution = self.aim(dict(me, pos=[ex, ey, ground]), target, laser)
+                    if solution:
+                        self.peek = Peek(target["id"], (x, y), (ex, ey), solution[:2], now)
+                        break
+                if self.peek is not None:
+                    break
+        peek = self.peek
+        if peek is None:
+            return None
+        charge = laser.get("charge", 0)
+        if ((peek.saw_charge and charge == 0)
+                or (not peek.saw_charge and now - peek.began > 0.6) or now - peek.began > 2.6):
+            peek.returning = True
+        if peek.returning:
+            if distance(pos, peek.cover) < 1.8 or now - peek.began > 4:
+                return None
+            return peek.cover, peek.aim
+        peek.saw_charge |= charge > 0
+        self.peek_precharge = True
+        threshold = max(laser["stats"].get("min_charge", 0.15), laser["stats"]["charge"] - 0.38)
+        return (peek.exposed if charge >= threshold else peek.cover), peek.aim
+
     def scout_goal(self, obs):
         pos = obs["self"]["pos"]
         now = obs["t"]
         self.frame_time = now
+        self.peek_precharge = False
         if (self.scout_waypoint is not None and now < self.scout_until
                 and distance(pos, self.scout_waypoint) > 8):
             return self.scout_waypoint
@@ -698,17 +784,27 @@ class Bot:
         goal = zone_goal
         quiet = False
         developing = False
+        peek_plan = None
+        supply = None
         kill_cubes = [cube for cube in obs["cubes"] if now < self.collect_until and near_dist >= 45
                       and distance(pos, cube["pos"]) < 42 and abs(cube["pos"][2] - pos[2]) <= 4]
         if not urgent_zone:
             resources = None
             if not opening and not self.pvp and not disengage and not recently_hit and near_dist > 42:
                 resources = self.resource_goal(obs, loot, enemies)
-            drops = [d for d in obs["drops"] if d["lands_in"] == 0 and d["holder"] in (None, me["id"])
-                     and hp < 0.78 and not enemies and not recently_hit
-                     and distance(pos, d["pos"]) < 42]
-            if drops:
-                goal = min(drops, key=lambda d: distance(pos, d["pos"]))["pos"][:2]
+            supply = self.choose_supply(obs, enemies)
+            if supply is not None:
+                drop, contest = supply
+                center = drop["pos"][:2]
+                if contest is not None:
+                    target = contest
+                    goal = self.kite_goal(me, contest, tactics, now, zone["radius"])
+                elif drop["holder"] not in (None, me["id"]):
+                    yaw = bearing(center, pos)
+                    edge = drop["radius"] + 4
+                    goal = (center[0] + math.cos(yaw) * edge, center[1] + math.sin(yaw) * edge)
+                else:
+                    goal = pos[:2] if distance(pos, center) <= drop["radius"] - 1 else center
             elif recover_covered:
                 goal = zone_goal
             elif execute:
@@ -739,7 +835,9 @@ class Bot:
             elif resources is not None:
                 goal = resources
             elif target is not None:
-                goal = self.kite_goal(me, target, tactics, now, zone["radius"])
+                if not disengage and len(active_enemies) <= 1:
+                    peek_plan = self.cover_peek(obs, target)
+                goal = peek_plan[0] if peek_plan else self.kite_goal(me, target, tactics, now, zone["radius"])
             elif not disengage:
                 cubes = [c for c in obs["cubes"] if abs(c["pos"][2] - pos[2]) < 4]
                 cap = self.config["cubes"]["stat_cap"] if not self.pvp else 6
@@ -755,8 +853,10 @@ class Bot:
                         goal = target["pos"][:2]
                 elif self.pvp and near_dist > 70:
                     quiet = True
-        if distance(pos, goal) < 2 and target is None and not disengage and not self.pvp:
+        if distance(pos, goal) < 2 and target is None and not disengage and not self.pvp and supply is None:
             goal = self.scout_goal(obs)
+        if peek_plan is None:
+            self.peek = None
         goal = self.safe_destination(obs, goal)
         # Dash back across the current circle boundary before pursuing the next circle.
         if not me["in_zone"] and distance(pos, goal) < 2:
@@ -766,11 +866,13 @@ class Bot:
             aim_error = angle_error(bearing(nearest["pos"], pos), nearest["aim"][0])
             if abs(aim_error) < 0.16:
                 dodge = threat_bearing + self.turn_side * math.pi / 2
+        if dodge is not None:
+            self.peek_precharge = False
         cover_from = None
         if nearest and disengage and not urgent_zone and dodge is None:
             tx, ty, tz = nearest["pos"]
             cover_from = (tx, ty, tz + self.config["mech"]["muzzle_height"])
-        roof_needed = (not self.pvp and not recover_covered and near_dist < 110
+        roof_needed = (supply is None and peek_plan is None and not self.pvp and not recover_covered and near_dist < 110
                        and (self.recovering or len(active_enemies) >= 2))
         climbing = self.roof_escape(obs, active_enemies, action, roof_needed, urgent_zone)
         if climbing:
@@ -784,15 +886,19 @@ class Bot:
             elif (execute and not urgent_zone and dodge is None and me["grounded"]
                   and distance(pos, target["pos"]) > 50 and math.hypot(*action.get("move", (0, 0))) > 0.25):
                 action["boost"] = me["energy"] - me["stats"]["boost_drain"] * self.turn_step >= 30
+            elif (supply is not None and supply[1] is None and dodge is None and me["grounded"]
+                  and distance(pos, goal) > 24 and math.hypot(*action.get("move", (0, 0))) > 0.25):
+                action["boost"] = me["energy"] - me["stats"]["boost_drain"] * self.turn_step >= 30
 
         if threat_bearing is None:
             self.scan = math.remainder(self.scan + 0.055, math.tau)
             sounds = [s for s in obs["sounds"] if s["dist"] == "near"
                       and s["kind"] in ("gun", "laser_charge", "lightning", "boost")]
-            look = sounds[0]["bearing"] if sounds else self.scan
+            look = (sounds[0]["bearing"] if sounds else bearing(pos, supply[0]["pos"])
+                    if supply else self.scan)
         else:
             look = threat_bearing
-        action["aim"] = [look, 0.0]
+        action["aim"] = list(peek_plan[1]) if peek_plan else [look, 0.0]
         self.attack(me, target, action)
         gun = next((w for w in me["weapons"] if w and w["kind"] == "gun"), None)
         if gun and not gun["reload"] and gun["ammo"] < gun["stats"]["mag"]:
