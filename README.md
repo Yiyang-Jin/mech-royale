@@ -6,10 +6,13 @@
 
 导航使用局部避障与掩体检测。屋顶路线和声音热力图属于后续工作。
 
+首个线上练习赛基线为 **2.17 分**，提交为 `8de229c17e8409b28b912e84978e30853b42e53f`（队伍报告）。当前候选改动按手持武器调整拉扯距离，低血量时尽量在掩体后停火回血。`strategy_bot.py` 顶部的 `PRACTICE` 和 `FREE_FOR_ALL` 可分别调整战术参数。
+
 在项目根目录的 PowerShell 中运行官方录制回放检查：
 
 ```powershell
 python -m unittest -v test_strategy
+python check/stress.py
 python check/check.py -- python -u strategy_bot.py
 ```
 
@@ -18,6 +21,7 @@ python check/check.py -- python -u strategy_bot.py
 ```powershell
 docker build --platform linux/amd64 -t mech-royale-bot .
 python check/check.py --map-dir /arena -- docker run --rm -i --network none --cpus 1 --memory 512m --memory-swap 512m --pids-limit 128 --cap-drop ALL --read-only --tmpfs /tmp:rw,size=64m --user 65534:65534 --volume "${PWD}/arena:/arena:ro" mech-royale-bot
+docker run --rm --network none --cpus 1 --memory 512m --memory-swap 512m --pids-limit 128 --cap-drop ALL --read-only --tmpfs /tmp:rw,size=64m --user 65534:65534 --volume "${PWD}:/suite:ro" --entrypoint python3 mech-royale-bot /suite/check/stress.py
 ```
 
-录制回放检查验证协议、响应时限和正常退出。实战成绩由赛事平台评估。提交时使用公开 GitHub 仓库，保留根目录的 `Dockerfile`，并在赛事页面填写仓库 URL。
+录制回放检查验证协议、响应时限和正常退出。压力测试在实地图上构造 15 台对手、30 枚弹体和 3 个空投，记录决策延迟和 Linux 进程峰值内存。实战成绩由赛事平台评估。提交时使用公开 GitHub 仓库，保留根目录的 `Dockerfile`，并在赛事页面填写仓库 URL。

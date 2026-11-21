@@ -1,8 +1,25 @@
 """Mech Royale strategy for the mechfight/1 game protocol."""
+from dataclasses import dataclass
 import math
 
 from arena_geometry import Arena
 import mechfight as mf
+
+
+@dataclass(frozen=True)
+class Tactics:
+    retreat_hp: float
+    recover_hp: float
+    gun_distance: float
+    laser_distance: float
+    mortar_distance: float
+    lightning_distance: float
+    kite_band: float = 14
+    cover_hold_distance: float = 50
+
+
+PRACTICE = Tactics(0.56, 0.88, 72, 115, 82, 29)
+FREE_FOR_ALL = Tactics(0.66, 0.88, 88, 135, 98, 32)
 
 
 def angle_error(goal, current):
@@ -37,9 +54,10 @@ def intercept(offset, velocity, speed, barrel=0):
 class Bot:
     name = "mech-royale"
 
-    def __init__(self, hello: mf.Hello):
+    def __init__(self, hello: mf.Hello, practice=PRACTICE, free_for_all=FREE_FOR_ALL):
         self.config = hello["config"]
         self.arena = Arena(hello["map"]["dir"])
+        self.practice, self.free_for_all = practice, free_for_all
         match = self.config["match"]
         self.physics_step = 1 / match["tick_hz"]
         self.turn_step = match["decide_every"] * self.physics_step
@@ -234,6 +252,46 @@ class Bot:
             return goal
         return tuple(c + (p - c) * extent / d for c, p in zip(center, goal))
 
+    def kite_goal(self, me, target, tactics):
+        pos = me["pos"]
+        gap = distance(pos, target["pos"])
+        facing = bearing(pos, target["pos"])
+        preferred = []
+        for weapon in me["weapons"]:
+            if weapon is None:
+                continue
+            kind, stats = weapon["kind"], weapon["stats"]
+            if kind == "lightning":
+                if me["energy"] >= stats["energy"]:
+                    preferred.append((10 if gap < stats["range"] * 0.8 else 1,
+                                      min(tactics.lightning_distance, stats["range"] * 0.72)))
+            elif kind == "laser":
+                preferred.append((7, min(tactics.laser_distance, stats["range"] * 0.66)))
+            elif kind == "mortar":
+                preferred.append((4, max(tactics.mortar_distance, stats["splash_radius"] * 3)))
+            elif kind == "gun":
+                preferred.append((6, min(tactics.gun_distance, stats["range"] * 0.66)))
+        ideal = max(preferred, default=(0, tactics.gun_distance))[1]
+        if not preferred:
+            ideal *= 1.4
+        # Blend strafe and range correction smoothly across the preferred band.
+        correction = max(-1, min(1, (gap - ideal) / tactics.kite_band))
+        yaw = facing + self.turn_side * (1 - correction) * math.pi / 2
+        return pos[0] + 32 * math.cos(yaw), pos[1] + 32 * math.sin(yaw)
+
+    def covered_for_recovery(self, me, enemies, tactics):
+        pos = me["pos"]
+        eye = (*pos[:2], pos[2] + me["stats"]["eye_height"])
+        muzzle = self.config["mech"]["muzzle_height"]
+        for enemy in enemies:
+            ex, ey, ez = enemy["pos"]
+            if distance(pos, enemy["pos"]) < tactics.cover_hold_distance:
+                return False
+            scale = 1 + self.config["cubes"]["size_per_cube"] * enemy.get("cubes", 0)
+            if not self.arena.solid_between((ex, ey, ez + muzzle * scale), eye):
+                return False
+        return True
+
     def move(self, me, goal, action, dodge, hurry, quiet, cover_from=None):
         d = distance(me["pos"], goal)
         if dodge is None and d < 2:
@@ -307,9 +365,10 @@ class Bot:
                          key=lambda a: distance(pos, a["pos"]))
         self.update_situation(obs, enemies)
         hp = me["hp"] / me["max_hp"]
-        if hp < (0.66 if self.pvp else 0.56):
+        tactics = self.free_for_all if self.pvp else self.practice
+        if hp < tactics.retreat_hp:
             self.recovering = True
-        if hp >= 0.88:
+        if hp >= tactics.recover_hp:
             self.recovering = False
 
         nearest = enemies[0] if enemies else None
@@ -326,8 +385,9 @@ class Bot:
             or (recently_hit and abs(angle_error(bearing(pos, e["pos"]), self.last_damage_bearing)) < 0.5)
             or e.get("hp", math.inf) < 0.26 * e.get("max_hp", 1400)
             or self.other_fight_until.get(e["id"], -1) > now), None)
-        if disengage and near_dist > 20:
-            target = None
+        if disengage:
+            # A distant hit restarts the heal timer even if it lands while retreating.
+            target = nearest if near_dist < 20 else None
 
         action: mf.Action = {"tick": obs["tick"]}
         if obs["offer"]:
@@ -351,15 +411,14 @@ class Bot:
                      and distance(pos, d["pos"]) < 42]
             if drops:
                 goal = min(drops, key=lambda d: distance(pos, d["pos"]))["pos"][:2]
-            elif threat_bearing is not None and (disengage or near_dist < (70 if self.pvp else 54)):
-                side = 0.58 * self.turn_side if not disengage else 0.22 * self.turn_side
-                away = threat_bearing + math.pi + side
+            elif (self.recovering and me["grounded"] and not recently_hit
+                  and self.covered_for_recovery(me, enemies, tactics)):
+                goal = zone_goal
+            elif threat_bearing is not None and (disengage or (self.pvp and target is None and near_dist < 70)):
+                away = threat_bearing + math.pi + 0.22 * self.turn_side
                 goal = (pos[0] + 40 * math.cos(away), pos[1] + 40 * math.sin(away))
             elif target is not None:
-                yaw = bearing(pos, target["pos"])
-                if near_dist < 105:
-                    yaw += math.pi / 2 * self.turn_side
-                goal = (pos[0] + 26 * math.cos(yaw), pos[1] + 26 * math.sin(yaw))
+                goal = self.kite_goal(me, target, tactics)
             elif not disengage:
                 cubes = [c for c in obs["cubes"] if abs(c["pos"][2] - pos[2]) < 4]
                 cap = self.config["cubes"]["stat_cap"] if not self.pvp else 6
