@@ -2,3 +2,5 @@
 !arena_geometry.py
 !strategy_bot.py
 !mechfight.py
+!canary_path.py
+!canary_bot.py
