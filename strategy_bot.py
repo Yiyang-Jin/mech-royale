@@ -72,6 +72,7 @@ class Bot:
     def __init__(self, hello: mf.Hello, practice=PRACTICE, free_for_all=FREE_FOR_ALL):
         self.config = hello["config"]
         self.arena = Arena(hello["map"]["dir"])
+        self.pickup_radius = self.config["loot"]["pickup_radius"]
         self.practice, self.free_for_all = practice, free_for_all
         match = self.config["match"]
         self.physics_step = 1 / match["tick_hz"]
@@ -490,7 +491,7 @@ class Bot:
     def loot(self, obs, enemies, action):
         me = obs["self"]
         pos, weapons = me["pos"], me["weapons"]
-        reach = self.config["loot"]["pickup_radius"]
+        reach = self.pickup_radius
         held = {weapon["kind"] for weapon in weapons if weapon}
         order = {"gun": 1, "mortar": 2, "laser": 3, "lightning": 4}
         if obs["zone"]["radius"] > 85:
@@ -578,6 +579,58 @@ class Bot:
         self.scout_turn += 1
         return self.scout_waypoint
 
+    def upgrade_choice(self, me, offer, enemy_distance):
+        order = {"mortar": 1, "gun": 2, "lightning": 3, "laser": 4}
+        if enemy_distance < 45:
+            order["lightning"] = 5
+        main = max((w["kind"] for w in me["weapons"] if w), key=order.get, default="gun")
+
+        def rank(choice):
+            upgrade = choice["id"]
+            kind, _, effect = upgrade.partition("_")
+            if upgrade == "armor":
+                return 50
+            if kind == main and effect in ("damage", "rate", "charge", "reload", "mag", "efficiency"):
+                return 40 if effect in ("damage", "rate", "charge", "reload") else 39
+            if upgrade in ("servos", "reactor", "jets", "capacitor"):
+                return 30
+            if upgrade in ("nanites", "plating"):
+                return 25
+            if upgrade == "sensors":
+                return 20
+            return 0
+
+        return max(range(len(offer["choices"])), key=lambda i: rank(offer["choices"][i]))
+
+    def rush_weapon(self, obs, loot):
+        me = obs["self"]
+        pos = me["pos"]
+        if None not in me["weapons"]:
+            return None
+        usable = [pickup for pickup in loot if pickup["kind"] != "gun"
+                  and distance(pos, pickup["pos"]) < 140
+                  and distance(pickup["pos"], self.safe_destination(obs, pickup["pos"][:2])) < 2]
+        pickup = min(usable, key=lambda p: (p["kind"] == "mortar", distance(pos, p["pos"])), default=None)
+        return tuple(pickup["pos"][:2]) if pickup else None
+
+    def farm_along_route(self, obs, goal):
+        pos = obs["self"]["pos"]
+        distance_to_goal = distance(pos, goal)
+        if distance_to_goal < 2 or obs["self"]["cubes"] >= self.config["cubes"]["stat_cap"]:
+            return None
+        nx, ny = (goal[0] - pos[0]) / distance_to_goal, (goal[1] - pos[1]) / distance_to_goal
+        drones = [actor for actor in obs["mechs"] if actor["kind"] == "npc"]
+        if len(drones) != 1:
+            drones = []
+        candidates = []
+        for item in (*obs["crates"], *drones):
+            x, y, z = item["pos"]
+            dx, dy = x - pos[0], y - pos[1]
+            if (abs(z - pos[2]) < 6 and -3 <= dx * nx + dy * ny <= distance_to_goal + 3
+                    and abs(dx * ny - dy * nx) < 15 and math.hypot(dx, dy) < 75):
+                candidates.append(item)
+        return min(candidates, key=lambda item: distance(pos, item["pos"]), default=None)
+
     def act(self, obs: mf.Observation) -> mf.Action:
         me = obs["self"]
         pos = me["pos"]
@@ -618,11 +671,7 @@ class Bot:
 
         action: mf.Action = {"tick": obs["tick"]}
         if obs["offer"]:
-            order = ("armor", "nanites", "servos", "plating", "reactor", "jets", "sensors",
-                     "gun_mag", "laser_charge", "gun_damage", "lightning_range")
-            ranks = {key: len(order) - i for i, key in enumerate(order)}
-            action["pick"] = max(range(len(obs["offer"]["choices"])),
-                                 key=lambda i: ranks.get(obs["offer"]["choices"][i]["id"], 0))
+            action["pick"] = self.upgrade_choice(me, obs["offer"], near_dist)
         loot = self.loot(obs, enemies, action)
         zone = obs["zone"]
         zone_goal = self.safe_destination(obs, pos[:2])
@@ -632,10 +681,13 @@ class Bot:
 
         goal = zone_goal
         quiet = False
+        rushing = False
         recover_covered = (self.recovering and me["grounded"] and not recently_hit
                            and self.covered_for_recovery(me, enemies, tactics))
         if not urgent_zone:
             resources = None
+            rush = (self.rush_weapon(obs, loot) if not disengage and not recently_hit and near_dist >= 80
+                    else None)
             if not self.pvp and not disengage and not recently_hit and near_dist > 42:
                 resources = self.resource_goal(obs, loot, enemies)
             drops = [d for d in obs["drops"] if d["lands_in"] == 0 and d["holder"] in (None, me["id"])
@@ -648,6 +700,12 @@ class Bot:
             elif threat_bearing is not None and (disengage or (self.pvp and target is None and near_dist < 70)):
                 away = threat_bearing + math.pi + 0.33 * self.weave_side(now)
                 goal = (pos[0] + 40 * math.cos(away), pos[1] + 40 * math.sin(away))
+            elif rush is not None:
+                goal = rush
+                rushing = True
+                farm_target = self.farm_along_route(obs, goal)
+                if farm_target is not None:
+                    target = farm_target
             elif resources is not None:
                 goal = resources
             elif target is not None:
@@ -667,7 +725,7 @@ class Bot:
                         goal = target["pos"][:2]
                 elif self.pvp and near_dist > 70:
                     quiet = True
-        if distance(pos, goal) < 2 and target is None and not disengage and not self.pvp:
+        if distance(pos, goal) < 2 and target is None and not disengage and not self.pvp and not rushing:
             goal = self.scout_goal(obs)
         goal = self.safe_destination(obs, goal)
         # Dash back across the current circle boundary before pursuing the next circle.
@@ -690,6 +748,9 @@ class Bot:
         else:
             self.move(me, goal, action, dodge, urgent_zone or (disengage and near_dist < 95),
                       quiet and dodge is None and not urgent_zone, cover_from)
+            if (rushing and dodge is None and me["grounded"] and distance(pos, goal) > 2 * self.pickup_radius
+                    and math.hypot(*action.get("move", (0, 0))) > 0.25):
+                action["boost"] = me["energy"] - me["stats"]["boost_drain"] * self.turn_step >= 30
 
         if threat_bearing is None:
             self.scan = math.remainder(self.scan + 0.055, math.tau)

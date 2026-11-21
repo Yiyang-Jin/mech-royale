@@ -173,6 +173,32 @@ class StrategyTests(unittest.TestCase):
         obs["t"] += 4
         self.assertNotEqual(bot.scout_goal(obs), waypoint)
 
+    def test_safe_weapon_rush_boosts_toward_laser_and_farms_on_route(self):
+        bot = Bot(self.hello)
+        obs = deepcopy(self.replay[0])
+        x, y, z = obs["self"]["pos"]
+        crate = {"id": 801, "pos": [x + 22, y, z], "hp": 300}
+        obs.update(mechs=[], crates=[crate], pickups=[
+            {"id": 301, "kind": "mortar", "pos": [x, y + 18, z]},
+            {"id": 302, "kind": "laser", "pos": [x + 55, y, z]},
+        ])
+        with (patch.object(bot.arena, "walkable", return_value=True),
+              patch.object(bot, "attack") as attack):
+            action = bot.act(obs)
+            self.assertGreater(action["move"][0], 0.9)
+            self.assertTrue(action["boost"])
+            self.assertEqual(attack.call_args.args[1], crate)
+            obs["self"]["energy"] = 31
+            self.assertFalse(bot.act(obs)["boost"])
+
+    def test_upgrade_order_prefers_armor_then_primary_damage_then_mobility(self):
+        bot = Bot(self.hello)
+        me = self.replay[0]["self"]
+        offer = {"choices": [{"id": key} for key in ("sensors", "servos", "gun_damage", "armor")]}
+        for chosen in (3, 2, 1):
+            self.assertEqual(bot.upgrade_choice(me, offer, 120), chosen)
+            offer["choices"].pop()
+
     def test_kiting_reverses_tangent_without_giving_up_range(self):
         bot = Bot(self.hello)
         me = deepcopy(self.replay[0]["self"])
