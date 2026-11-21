@@ -114,6 +114,8 @@ class Bot:
         self.scout_turn = 0
         self.turn_side = 1 if hello["slot"] % 2 else -1
         self.weave_offset = hello["slot"] * 0.083
+        self.orbit_side = self.turn_side
+        self.orbit_until = -math.inf
         self.roof = None
         self.roof_phase = "approach"
         self.roof_deadline = -math.inf
@@ -334,53 +336,125 @@ class Bot:
                 ):
                     fire[shot.slot] = True
 
+    def mortar_impact(self, shot, gravity):
+        x, y, z = shot["pos"]
+        vx, vy, vz = shot["vel"]
+
+        def height_above_ground(t):
+            return z + vz * t - gravity * t * t / 2 - self.arena.ground(x + vx * t, y + vy * t)
+
+        if height_above_ground(0) <= 0:
+            return None
+        for step in range(1, 21):
+            hi = step / 10
+            if height_above_ground(hi) > 0:
+                continue
+            lo = (step - 1) / 10
+            for _ in range(8):
+                mid = (lo + hi) / 2
+                if height_above_ground(mid) > 0:
+                    lo = mid
+                else:
+                    hi = mid
+            return hi, (x + vx * hi, y + vy * hi)
+        return None
+
     def projectile_threat(self, obs):
         me = obs["self"]
         x, y, z = me["pos"]
         vx, vy, vz = me["vel"]
         radius = me["stats"]["radius"]
         best = None
+        landing = None
+        mortar = self.config["weapons"]["mortar"]
         for shot in obs["projectiles"]:
             px, py, pz = shot["pos"]
             sx, sy, sz = shot["vel"]
             dx, dy = px - x, py - y
+            shell = shot["kind"] == "mortar"
+            if shell:
+                speed = sx * sx + sy * sy
+                closest_t = max(0, min(2, -(dx * sx + dy * sy) / speed)) if speed else 0
+                if math.hypot(dx + sx * closest_t, dy + sy * closest_t) <= 9.5:
+                    impact = self.mortar_impact(shot, mortar["gravity"])
+                    if impact is not None and distance((x, y), impact[1]) <= 9.5:
+                        if landing is None or impact[0] < landing[0]:
+                            escape = bearing(impact[1], (x, y)) if distance((x, y), impact[1]) > 0.2 else (
+                                math.atan2(sy, sx) + self.turn_side * math.pi / 2
+                            )
+                            landing = impact[0], escape
             rx, ry = sx - vx, sy - vy
             speed_squared = rx * rx + ry * ry
             if speed_squared < 1:
                 continue
             t = -(dx * rx + dy * ry) / speed_squared
-            if not 0 < t < 0.45:
+            if not 0 < t < (0.45 if shell else 0.85):
                 continue
             closest = dx + rx * t, dy + ry * t
-            shell = shot["kind"] == "mortar"
-            mortar = self.config["weapons"]["mortar"]
-            clearance = radius + (mortar["splash_radius"] if shell else 0.7)
+            clearance = radius + (mortar["splash_radius"] if shell else 1.2)
             height = pz - z + (sz - vz) * t - (mortar["gravity"] * t * t / 2 if shell else 0)
-            if math.hypot(*closest) > clearance or not -0.5 <= height <= me["stats"]["height"] + 0.5:
+            if math.hypot(*closest) >= clearance or not -0.5 <= height <= me["stats"]["height"] + 0.5:
                 continue
             side = 1 if ry * closest[0] - rx * closest[1] >= 0 else -1
             dodge = math.atan2(rx * side, -ry * side)
             if best is None or t < best[0]:
                 best = t, dodge
+        if landing is not None:
+            return landing[1]
         if best is not None:
             return best[1]
         return None
 
-    def safe_destination(self, obs, goal, margin=16):
+    def planning_circle(self, obs):
         zone = obs["zone"]
-        current = zone["center"]
-        upcoming = zone["next_center"]
-        active = obs["t"] >= zone["shrink_start"] - 14
-        center = upcoming if active else current
-        radius = zone["next_radius"] if active else zone["radius"]
+        if obs["t"] >= zone["shrink_start"] - 14:
+            return zone["next_center"], zone["next_radius"]
+        return zone["center"], zone["radius"]
+
+    def safe_destination(self, obs, goal, margin=16):
+        center, radius = self.planning_circle(obs)
         extent = max(0, radius - margin)
         d = distance(center, goal)
         if d <= extent:
             return goal
         return tuple(c + (p - c) * extent / d for c, p in zip(center, goal))
 
+    def orbit_goal(self, obs, goal, enemies, threat):
+        me = obs["self"]
+        pos, now = me["pos"], obs["t"]
+        center, radius = self.planning_circle(obs)
+        radial = distance(pos, center)
+        if radial < 1 or (radius - radial >= 85 and radius - distance(goal, center) >= 35):
+            return goal
+        out = bearing(center, pos)
+        away = threat + math.pi
+        track = max(0, radius - min(35, radius * 0.45))
+        advance = min(40, max(4, track * 0.65))
+        candidates = {}
+        locked = now < self.orbit_until
+        sides = (self.orbit_side,) if locked else (self.turn_side, -self.turn_side)
+        for side in sides:
+            yaw = out + side * math.pi / 2
+            dx, dy = math.cos(yaw), math.sin(yaw)
+            angle = out + side * advance / max(track, 1)
+            step_radius = max(0, min(track, radial + 8))
+            point = (center[0] + step_radius * math.cos(angle),
+                     center[1] + step_radius * math.sin(angle))
+            if locked:
+                return point
+            step = bearing(pos, point)
+            walkway = sum(self.arena.walkable(me, step, reach) for reach in (8, 20, 40))
+            crowd = sum(max(0, 1 - distance((pos[0] + dx * 40, pos[1] + dy * 40), enemy["pos"]) / 40)
+                        for enemy in enemies)
+            score = math.cos(angle_error(step, away)) + 0.55 * walkway - crowd
+            candidates[side] = (score, point)
+        self.orbit_side = max(candidates, key=lambda side: candidates[side][0])
+        self.orbit_until = now + 6
+        return candidates[self.orbit_side][1]
+
     def weave_side(self, now):
-        return self.turn_side * (-1 if int((now + self.weave_offset) / 0.78) % 2 else 1)
+        phase = (now + self.weave_offset) % 1.05
+        return self.turn_side if phase < 0.45 else -self.turn_side
 
     def kite_goal(self, me, target, tactics, now=0, zone_radius=math.inf, execute=False):
         pos = me["pos"]
@@ -649,6 +723,37 @@ class Bot:
                 continue
             candidates.append((gap + item.get("hp", 300) * 0.08, item))
         return min(candidates, key=lambda option: option[0])[1] if candidates else None
+
+    def farm_route_safe(self, pos, goal, enemies):
+        dx, dy = goal[0] - pos[0], goal[1] - pos[1]
+        length_squared = dx * dx + dy * dy
+        for enemy in enemies:
+            ex, ey = enemy["pos"][0] - pos[0], enemy["pos"][1] - pos[1]
+            fraction = max(0, min(1, (ex * dx + ey * dy) / length_squared)) if length_squared else 0
+            if math.hypot(ex - fraction * dx, ey - fraction * dy) < 80:
+                return False
+        return True
+
+    def midgame_farm(self, obs, enemies, goal):
+        me = obs["self"]
+        pos = me["pos"]
+        heading = bearing(pos, goal) if distance(pos, goal) >= 2 else None
+        candidates = [
+            item for item in (*obs["crates"], *(a for a in obs["mechs"] if a["kind"] == "npc"))
+            if distance(pos, item["pos"]) <= 38 and abs(item["pos"][2] - pos[2]) <= 6
+        ]
+        candidates.sort(key=lambda item: distance(pos, item["pos"]) + 0.03 * item.get("hp", 300)
+                        - (8 if item.get("kind") == "npc" else 0))
+        farm = next((item for item in candidates
+                     if any(self.aim(me, item, w) is not None for w in me["weapons"] if w)), None)
+        cubes = [
+            cube["pos"] for cube in obs["cubes"]
+            if distance(pos, cube["pos"]) <= 38 and abs(cube["pos"][2] - pos[2]) <= 4
+            and (heading is None or abs(angle_error(bearing(pos, cube["pos"]), heading)) <= math.pi / 4)
+            and distance(cube["pos"], self.safe_destination(obs, cube["pos"][:2])) <= 1
+            and self.farm_route_safe(pos, cube["pos"], enemies)
+        ]
+        return farm, min(cubes, key=lambda point: distance(pos, point), default=None)
 
     def can_execute(self, me, target, enemies):
         if target is None or me["hp"] <= 600:
@@ -1028,6 +1133,7 @@ class Bot:
             ):
                 away = threat_bearing + math.pi + 0.33 * self.weave_side(now)
                 goal = (pos[0] + 40 * math.cos(away), pos[1] + 40 * math.sin(away))
+                goal = self.orbit_goal(obs, goal, enemies, threat_bearing)
             elif opening:
                 developing = True
                 resources = self.resource_goal(obs, loot, enemies, opening=True)
@@ -1050,6 +1156,10 @@ class Bot:
                 if not disengage and len(active_enemies) <= 1:
                     peek_plan = self.cover_peek(obs, target)
                 goal = peek_plan[0] if peek_plan else self.kite_goal(me, target, tactics, now, zone["radius"])
+                if peek_plan is None:
+                    facing = bearing(pos, target["pos"])
+                    if math.cos(angle_error(bearing(pos, goal), facing)) < -1e-6:
+                        goal = self.orbit_goal(obs, goal, enemies, facing)
             elif not disengage:
                 cubes = [c for c in obs["cubes"] if abs(c["pos"][2] - pos[2]) < 4]
                 cap = self.config["cubes"]["stat_cap"] if not self.pvp else 6
@@ -1065,6 +1175,28 @@ class Bot:
                         goal = target["pos"][:2]
                 elif self.pvp and near_dist > 70:
                     quiet = True
+        if (not urgent_zone and not disengage and supply is None and not execute
+                and peek_plan is None and corner is None):
+            single_gun = len([w for w in me["weapons"] if w and w["kind"] == "gun"]) == 1 and None in me["weapons"]
+            laser = None
+            if single_gun and near_dist >= 80:
+                laser = min((p for p in loot if p["kind"] == "laser" and distance(pos, p["pos"]) <= 30
+                             and distance(p["pos"], self.safe_destination(obs, p["pos"][:2])) <= 1
+                             and self.farm_route_safe(pos, p["pos"], enemies)),
+                            key=lambda p: distance(pos, p["pos"]), default=None)
+            if laser is not None:
+                goal = laser["pos"][:2]
+                if distance(pos, goal) <= self.config["loot"]["pickup_radius"]:
+                    action["take"] = laser["id"]
+                else:
+                    action.pop("take", None)
+            elif (me["cubes"] < self.config["cubes"]["stat_cap"] and hp > 0.65 and near_dist > 95
+                  and not recently_hit and self.farm_route_safe(pos, self.safe_destination(obs, goal), enemies)):
+                farm, cube = self.midgame_farm(obs, enemies, goal)
+                if farm is not None:
+                    target = farm
+                if cube is not None:
+                    goal = cube[:2]
         if distance(pos, goal) < 2 and target is None and not disengage and not self.pvp and supply is None:
             goal = self.scout_goal(obs)
         if peek_plan is None:

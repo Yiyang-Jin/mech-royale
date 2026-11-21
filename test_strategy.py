@@ -44,6 +44,30 @@ class StrategyTests(unittest.TestCase):
         bot.update_situation(obs, [])
         self.assertTrue(bot.pvp)
 
+    def test_early_bullet_cpa_and_mortar_landing_priority(self):
+        bot = Bot(self.hello)
+        obs = deepcopy(self.replay[0])
+        me = obs["self"]
+        me.update(pos=[0, 0, 0], vel=[0, 0, 0])
+        bullet = {"kind": "gun", "pos": [-165, me["stats"]["radius"] + 0.9, 4],
+                  "vel": [252, 0, 0]}
+        obs["projectiles"] = [bullet]
+        self.assertIsNotNone(bot.projectile_threat(obs))
+        shell = {"kind": "mortar", "pos": [-70, 0, 24.75], "vel": [48, 0, 0]}
+        obs["projectiles"].append(shell)
+        with patch.object(bot.arena, "ground", return_value=0):
+            impact = bot.mortar_impact(shell, 22)
+            self.assertAlmostEqual(impact[0], 1.5, places=2)
+            self.assertAlmostEqual(abs(bot.projectile_threat(obs)), math.pi)
+
+    def test_weave_alternates_short_and_long_intervals(self):
+        bot = Bot(self.hello)
+        bot.weave_offset = 0
+        self.assertEqual(bot.weave_side(0.44), bot.turn_side)
+        self.assertEqual(bot.weave_side(0.46), -bot.turn_side)
+        self.assertEqual(bot.weave_side(1.04), -bot.turn_side)
+        self.assertEqual(bot.weave_side(1.06), bot.turn_side)
+
     def test_projectile_approach_and_height(self):
         bot = Bot(self.hello)
         obs = deepcopy(self.replay[0])
@@ -165,6 +189,28 @@ class StrategyTests(unittest.TestCase):
             bot.act(obs)
             self.assertEqual(attack.call_args.args[1], enemy)
 
+    def test_midgame_farms_with_far_enemy_and_prioritizes_nearby_laser(self):
+        bot = Bot(self.hello)
+        obs = deepcopy(self.replay[0])
+        me = obs["self"]
+        x, y, z = me["pos"]
+        obs["zone"].update(center=[x, y], next_center=[x, y], radius=400, next_radius=320)
+        foe = {"id": 12, "kind": "mech", "pos": [x + 160, y, z], "hp": 1400, "aim": [0, 0]}
+        crate = {"id": 1001, "pos": [x + 20, y + 3, z], "hp": 300}
+        obs.update(t=100, mechs=[foe], crates=[crate], cubes=[], drops=[], pickups=[],
+                   sounds=[], projectiles=[], events=[], beams=[])
+        with (patch.object(bot.arena, "clear_shot", return_value=True),
+              patch.object(bot.arena, "walkable", return_value=True),
+              patch.object(bot, "attack") as attack):
+            bot.act(obs)
+            self.assertIs(attack.call_args.args[1], crate)
+            me["cubes"] = 10
+            bot.act(obs)
+            self.assertIs(attack.call_args.args[1], foe)
+            foe["pos"][0] = x + 85
+            obs["pickups"] = [{"id": 8001, "kind": "laser", "pos": [x, y - 25, z]}]
+            self.assertLess(bot.act(obs)["move"][1], -0.9)
+
     def test_big_circle_keeps_range_with_laser_or_underarmed_gun(self):
         bot = Bot(self.hello)
         me = deepcopy(self.replay[0]["self"])
@@ -187,6 +233,23 @@ class StrategyTests(unittest.TestCase):
         self.assertEqual(bot.scout_goal(obs), waypoint)
         obs["t"] += 4
         self.assertNotEqual(bot.scout_goal(obs), waypoint)
+
+    def test_orbit_at_outer_edge_preserves_direction_for_six_seconds(self):
+        bot = Bot(self.hello)
+        obs = deepcopy(self.replay[0])
+        obs["self"]["pos"] = [-184, 0, 0]
+        obs["zone"].update(center=[0, 0], next_center=[0, 0], radius=200, next_radius=200)
+        obs["t"] = 80
+        enemy = {"pos": [-90, 0, 0]}
+        with patch.object(bot.arena, "walkable", side_effect=lambda me, yaw, reach: math.sin(yaw) > 0):
+            goal = bot.orbit_goal(obs, (-224, 0), [enemy], 0)
+        self.assertGreater(goal[1], 30)
+        self.assertEqual(bot.safe_destination(obs, goal), goal)
+        with patch.object(bot.arena, "walkable", side_effect=lambda me, yaw, reach: math.sin(yaw) < 0):
+            obs["t"] = 85.9
+            self.assertEqual(bot.orbit_goal(obs, (-224, 0), [enemy], 0), goal)
+            obs["t"] = 86
+            self.assertLess(bot.orbit_goal(obs, (-224, 0), [enemy], 0)[1], -30)
 
     def test_kiting_reverses_tangent_without_giving_up_range(self):
         bot = Bot(self.hello)
