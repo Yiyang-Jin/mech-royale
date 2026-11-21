@@ -301,7 +301,7 @@ class Bot:
     def weave_side(self, now):
         return self.turn_side * (-1 if int((now + self.weave_offset) / 0.78) % 2 else 1)
 
-    def kite_goal(self, me, target, tactics, now=0):
+    def kite_goal(self, me, target, tactics, now=0, zone_radius=math.inf):
         pos = me["pos"]
         gap = distance(pos, target["pos"])
         facing = bearing(pos, target["pos"])
@@ -312,14 +312,17 @@ class Bot:
             kind, stats = weapon["kind"], weapon["stats"]
             if kind == "lightning":
                 if me["energy"] >= stats["energy"]:
-                    preferred.append((10 if gap < stats["range"] * 0.8 else 1,
+                    preferred.append((10 if zone_radius <= 100 and gap < stats["range"] * 0.8 else 4,
                                       min(tactics.lightning_distance, stats["range"] * 0.72)))
             elif kind == "laser":
-                preferred.append((7, min(tactics.laser_distance, stats["range"] * 0.66)))
+                ideal = 150 if zone_radius > 140 else tactics.laser_distance
+                preferred.append((8, min(ideal, stats["range"] * 0.66)))
             elif kind == "mortar":
                 preferred.append((4, max(tactics.mortar_distance, stats["splash_radius"] * 3)))
             elif kind == "gun":
-                preferred.append((6, min(tactics.gun_distance, stats["range"] * 0.66)))
+                dangerous = target.get("hp", 0) > me["hp"] or "lightning" in target.get("weapons", ())
+                ideal = 105 if dangerous and zone_radius > 100 else tactics.gun_distance
+                preferred.append((6, min(ideal, stats["range"] * 0.66)))
         ideal = max(preferred, default=(0, tactics.gun_distance))[1]
         if not preferred:
             ideal *= 1.4
@@ -448,14 +451,26 @@ class Bot:
         action["boost"] = not past_edge and not me["grounded"] and me["energy"] >= 2
         return True
 
-    def loot(self, obs, enemies, action):
+    def weapon_order(self, radius):
+        if radius <= 100:
+            return {"mortar": 1, "gun": 2, "laser": 3, "lightning": 4}
+        return {"mortar": 1, "gun": 2, "lightning": 3, "laser": 4}
+
+    def replacement_slot(self, weapons, kind, order):
+        eligible = [
+            i for i, old in enumerate(weapons)
+            if order[kind] > order[old["kind"]] and not old.get("charge", 0)
+            and (old["kind"] != "gun"
+                 or {kind, weapons[1 - i]["kind"]} == {"laser", "lightning"})
+        ]
+        return min(eligible, key=lambda i: order[weapons[i]["kind"]], default=None)
+
+    def loot(self, obs, enemies, action, opening=False):
         me = obs["self"]
         pos, weapons = me["pos"], me["weapons"]
         reach = self.config["loot"]["pickup_radius"]
         held = {weapon["kind"] for weapon in weapons if weapon}
-        order = {"gun": 1, "mortar": 2, "laser": 3, "lightning": 4}
-        if obs["zone"]["radius"] > 85:
-            order["laser"], order["lightning"] = 4, 3
+        order = self.weapon_order(obs["zone"]["radius"])
         candidates = [p for p in obs["pickups"]
                       if p["kind"] not in held and abs(p["pos"][2] - pos[2]) <= 4]
         candidates.sort(key=lambda item: (-order[item["kind"]], distance(pos, item["pos"])))
@@ -463,32 +478,30 @@ class Bot:
             if distance(pos, item["pos"]) > reach:
                 continue
             if None not in weapons:
-                if enemies:
+                if enemies and not opening:
                     continue
-                eligible = [
-                    i for i, old in enumerate(weapons)
-                    if order[item["kind"]] > order[old["kind"]] and not old.get("charge", 0)
-                    and (old["kind"] != "gun"
-                         or {item["kind"], weapons[1 - i]["kind"]} == {"laser", "lightning"})
-                ]
-                if not eligible:
+                slot = self.replacement_slot(weapons, item["kind"], order)
+                if slot is None:
                     continue
-                action["drop"] = min(eligible, key=lambda i: order[weapons[i]["kind"]])
+                action["drop"] = slot
             action["take"] = item["id"]
             break
         return candidates
 
-    def resource_goal(self, obs, pickups, enemies):
+    def resource_goal(self, obs, pickups, enemies, opening=False):
         me = obs["self"]
         pos = me["pos"]
         needs_weapon = None in me["weapons"]
         needs_cubes = me["cubes"] < self.config["cubes"]["stat_cap"]
         options = []
-        if needs_weapon:
+        if needs_weapon or opening:
+            order = self.weapon_order(obs["zone"]["radius"])
+            preferred = max(order, key=order.get)
             for pickup in pickups:
-                bonus = {"laser": 12, "lightning": 7, "mortar": 4}.get(pickup["kind"])
-                if bonus is not None:
-                    options.append((pickup["pos"], 99 + bonus, 105))
+                kind = pickup["kind"]
+                if needs_weapon or self.replacement_slot(me["weapons"], kind, order) is not None:
+                    value = 96 + 10 * order[kind] + (40 if kind == preferred else 0)
+                    options.append((pickup["pos"], value, 140 if opening else 105))
         if needs_cubes:
             for cube in obs["cubes"]:
                 if abs(cube["pos"][2] - pos[2]) <= 4:
@@ -516,6 +529,25 @@ class Bot:
             if score > 15 and (best is None or score > best[0]):
                 best = score, tuple(point[:2])
         return best[1] if best else None
+
+    def opening_farm(self, obs, enemies, goal):
+        pos = obs["self"]["pos"]
+        nx, ny = (goal[0] - pos[0], goal[1] - pos[1]) if goal is not None else (0, 0)
+        length = math.hypot(nx, ny)
+        candidates = []
+        for item in (*obs["crates"], *(a for a in obs["mechs"] if a["kind"] == "npc")):
+            x, y, z = item["pos"]
+            dx, dy = x - pos[0], y - pos[1]
+            gap = math.hypot(dx, dy)
+            if gap > 110 or abs(z - pos[2]) > 6:
+                continue
+            if any(distance(item["pos"], enemy["pos"]) < 38 for enemy in enemies):
+                continue
+            if length > 2 and (abs(dx * ny - dy * nx) > 21 * length
+                               or not -5 * length <= dx * nx + dy * ny <= (length + 12) * length):
+                continue
+            candidates.append((gap + item.get("hp", 300) * 0.08, item))
+        return min(candidates, key=lambda option: option[0])[1] if candidates else None
 
     def scout_goal(self, obs):
         pos = obs["self"]["pos"]
@@ -578,13 +610,15 @@ class Bot:
                     target = nearest
 
         action: mf.Action = {"tick": obs["tick"]}
+        opening = (now < 70 and (None in me["weapons"] or me["cubes"] < 5)
+                   and near_dist > 55 and not disengage)
         if obs["offer"]:
             order = ("armor", "nanites", "servos", "plating", "reactor", "jets", "sensors",
                      "gun_mag", "laser_charge", "gun_damage", "lightning_range")
             ranks = {key: len(order) - i for i, key in enumerate(order)}
             action["pick"] = max(range(len(obs["offer"]["choices"])),
                                  key=lambda i: ranks.get(obs["offer"]["choices"][i]["id"], 0))
-        loot = self.loot(obs, enemies, action)
+        loot = self.loot(obs, enemies, action, opening)
         zone = obs["zone"]
         zone_goal = self.safe_destination(obs, pos[:2])
         urgent_zone = not me["in_zone"] or distance(pos, zone_goal) > me["stats"]["walk_speed"] * max(
@@ -593,11 +627,12 @@ class Bot:
 
         goal = zone_goal
         quiet = False
+        developing = False
         recover_covered = (self.recovering and me["grounded"] and not recently_hit
                            and self.covered_for_recovery(me, enemies, tactics))
         if not urgent_zone:
             resources = None
-            if not self.pvp and not disengage and not recently_hit and near_dist > 42:
+            if not opening and not self.pvp and not disengage and not recently_hit and near_dist > 42:
                 resources = self.resource_goal(obs, loot, enemies)
             drops = [d for d in obs["drops"] if d["lands_in"] == 0 and d["holder"] in (None, me["id"])
                      and hp < 0.78 and not enemies and not recently_hit
@@ -606,13 +641,33 @@ class Bot:
                 goal = min(drops, key=lambda d: distance(pos, d["pos"]))["pos"][:2]
             elif recover_covered:
                 goal = zone_goal
-            elif threat_bearing is not None and (disengage or (self.pvp and target is None and near_dist < 70)):
+            elif threat_bearing is not None and (
+                disengage or (not opening and self.pvp and target is None and near_dist < 70)
+            ):
                 away = threat_bearing + math.pi + 0.33 * self.weave_side(now)
                 goal = (pos[0] + 40 * math.cos(away), pos[1] + 40 * math.sin(away))
+            elif opening:
+                developing = True
+                resources = self.resource_goal(obs, loot, enemies, opening=True)
+                farm = self.opening_farm(obs, enemies, resources)
+                if resources is not None:
+                    goal = resources
+                elif farm is not None and distance(pos, farm["pos"]) > 23:
+                    goal = farm["pos"][:2]
+                elif nearest is not None and near_dist < 90:
+                    away = threat_bearing + math.pi + 0.45 * self.turn_side
+                    goal = (pos[0] + 55 * math.cos(away), pos[1] + 55 * math.sin(away))
+                else:
+                    goal = self.scout_goal(obs)
+                # Allow a short shot window while moving, without turning it into a chase.
+                if farm is not None:
+                    target = farm
+                elif near_dist < 85 or int(now * 10 + 1e-6) % 20 >= 2:
+                    target = None
             elif resources is not None:
                 goal = resources
             elif target is not None:
-                goal = self.kite_goal(me, target, tactics, now)
+                goal = self.kite_goal(me, target, tactics, now, zone["radius"])
             elif not disengage:
                 cubes = [c for c in obs["cubes"] if abs(c["pos"][2] - pos[2]) < 4]
                 cap = self.config["cubes"]["stat_cap"] if not self.pvp else 6
@@ -651,6 +706,9 @@ class Bot:
         else:
             self.move(me, goal, action, dodge, urgent_zone or (disengage and near_dist < 95),
                       quiet and dodge is None and not urgent_zone, cover_from)
+            if (developing and dodge is None and me["grounded"] and distance(pos, goal) > 9
+                    and math.hypot(*action.get("move", (0, 0))) > 0.25):
+                action["boost"] = me["energy"] - me["stats"]["boost_drain"] * self.turn_step >= 30
 
         if threat_bearing is None:
             self.scan = math.remainder(self.scan + 0.055, math.tau)

@@ -60,7 +60,7 @@ class StrategyTests(unittest.TestCase):
         self.assertGreater(bot.kite_goal(me, {"pos": [95, 0, 0]}, PRACTICE)[0], 0)
         stats = self.hello["config"]["weapons"]["lightning"]
         me["weapons"][1] = {"kind": "lightning", "stats": stats, "cooldown": 0}
-        self.assertGreater(bot.kite_goal(me, {"pos": [32, 0, 0]}, PRACTICE)[0], 0)
+        self.assertGreater(bot.kite_goal(me, {"pos": [32, 0, 0]}, PRACTICE, zone_radius=90)[0], 0)
 
     def test_fires_both_slots_when_their_aim_overlaps(self):
         bot = Bot(self.hello)
@@ -126,7 +126,8 @@ class StrategyTests(unittest.TestCase):
         pickup = {"id": 8000, "kind": "laser", "pos": [x, y + 52, z]}
         enemy = {"id": 12, "kind": "mech", "pos": [x + 65, y, z],
                  "hp": 1400, "max_hp": 1400, "aim": [0, 0]}
-        obs.update(mechs=[enemy], pickups=[pickup], cubes=[], drops=[], projectiles=[])
+        obs.update(t=70, mechs=[enemy], pickups=[pickup], cubes=[], drops=[], projectiles=[])
+        obs["zone"].update(shrink_start=140, shrink_end=180)
         with (patch.object(bot.arena, "solid_between", return_value=False),
               patch.object(bot.arena, "walkable", return_value=True),
               patch.object(bot, "aim", return_value=(0, 0, 0.04, 0.04))):
@@ -135,6 +136,41 @@ class StrategyTests(unittest.TestCase):
             self.assertEqual(action["fire"], [True, False])
             enemy["pos"] = [x, y + 65, z]
             self.assertIsNone(bot.resource_goal(obs, [pickup], [enemy]))
+
+    def test_opening_runs_to_laser_and_prefers_a_crate_to_a_distant_mech(self):
+        bot = Bot(self.hello)
+        obs = deepcopy(self.replay[0])
+        me = obs["self"]
+        x, y, z = me["pos"]
+        laser = {"id": 8000, "kind": "laser", "pos": [x, y + 58, z]}
+        lightning = {"id": 8001, "kind": "lightning", "pos": [x, y + 29, z]}
+        crate = {"id": 1000, "pos": [x, y + 24, z], "hp": 300}
+        enemy = {"id": 12, "kind": "mech", "pos": [x + 66, y, z], "aim": [0, 0]}
+        obs.update(t=10, pickups=[lightning, laser], crates=[crate],
+                   mechs=[enemy], sounds=[], projectiles=[])
+        with (patch.object(bot.arena, "solid_between", return_value=False),
+              patch.object(bot.arena, "walkable", return_value=True),
+              patch.object(bot, "attack") as attack,
+              patch.object(bot, "move", wraps=bot.move) as move):
+            action = bot.act(obs)
+            self.assertEqual(move.call_args.args[1], tuple(laser["pos"][:2]))
+            self.assertEqual(attack.call_args.args[1], crate)
+            self.assertTrue(action["boost"])
+            enemy["pos"] = [x + 50, y, z]
+            bot.act(obs)
+            self.assertEqual(attack.call_args.args[1], enemy)
+
+    def test_big_circle_keeps_range_with_laser_or_underarmed_gun(self):
+        bot = Bot(self.hello)
+        me = deepcopy(self.replay[0]["self"])
+        me["pos"] = [0, 0, 0]
+        charged_enemy = {"pos": [90, 0, 0], "hp": 1000, "weapons": ["lightning"]}
+        self.assertLess(bot.kite_goal(me, charged_enemy, PRACTICE)[0], 0)
+        weapons = self.hello["config"]["weapons"]
+        me["weapons"] = [{"kind": k, "stats": weapons[k]} for k in ("laser", "lightning")]
+        self.assertLess(bot.kite_goal(me, {"pos": [130, 0, 0]}, PRACTICE)[0], 0)
+        self.assertGreater(bot.kite_goal(me, {"pos": [175, 0, 0]}, PRACTICE)[0], 0)
+        self.assertEqual(max(bot.weapon_order(90), key=bot.weapon_order(90).get), "lightning")
 
     def test_scout_keeps_waypoint_while_torso_scans(self):
         bot = Bot(self.hello)
