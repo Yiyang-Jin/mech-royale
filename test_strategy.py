@@ -188,6 +188,23 @@ class StrategyTests(unittest.TestCase):
         obs["t"] += 4
         self.assertNotEqual(bot.scout_goal(obs), waypoint)
 
+    def test_orbit_at_outer_edge_preserves_direction_for_six_seconds(self):
+        bot = Bot(self.hello)
+        obs = deepcopy(self.replay[0])
+        obs["self"]["pos"] = [-184, 0, 0]
+        obs["zone"].update(center=[0, 0], next_center=[0, 0], radius=200, next_radius=200)
+        obs["t"] = 80
+        enemy = {"pos": [-90, 0, 0]}
+        with patch.object(bot.arena, "walkable", side_effect=lambda me, yaw, reach: math.sin(yaw) > 0):
+            goal = bot.orbit_goal(obs, (-224, 0), [enemy], 0)
+        self.assertGreater(goal[1], 30)
+        self.assertEqual(bot.safe_destination(obs, goal), goal)
+        with patch.object(bot.arena, "walkable", side_effect=lambda me, yaw, reach: math.sin(yaw) < 0):
+            obs["t"] = 85.9
+            self.assertEqual(bot.orbit_goal(obs, (-224, 0), [enemy], 0), goal)
+            obs["t"] = 86
+            self.assertLess(bot.orbit_goal(obs, (-224, 0), [enemy], 0)[1], -30)
+
     def test_kiting_reverses_tangent_without_giving_up_range(self):
         bot = Bot(self.hello)
         me = deepcopy(self.replay[0]["self"])

@@ -114,6 +114,8 @@ class Bot:
         self.scout_turn = 0
         self.turn_side = 1 if hello["slot"] % 2 else -1
         self.weave_offset = hello["slot"] * 0.083
+        self.orbit_side = self.turn_side
+        self.orbit_until = -math.inf
         self.roof = None
         self.roof_phase = "approach"
         self.roof_deadline = -math.inf
@@ -366,18 +368,52 @@ class Bot:
             return best[1]
         return None
 
-    def safe_destination(self, obs, goal, margin=16):
+    def planning_circle(self, obs):
         zone = obs["zone"]
-        current = zone["center"]
-        upcoming = zone["next_center"]
-        active = obs["t"] >= zone["shrink_start"] - 14
-        center = upcoming if active else current
-        radius = zone["next_radius"] if active else zone["radius"]
+        if obs["t"] >= zone["shrink_start"] - 14:
+            return zone["next_center"], zone["next_radius"]
+        return zone["center"], zone["radius"]
+
+    def safe_destination(self, obs, goal, margin=16):
+        center, radius = self.planning_circle(obs)
         extent = max(0, radius - margin)
         d = distance(center, goal)
         if d <= extent:
             return goal
         return tuple(c + (p - c) * extent / d for c, p in zip(center, goal))
+
+    def orbit_goal(self, obs, goal, enemies, threat):
+        me = obs["self"]
+        pos, now = me["pos"], obs["t"]
+        center, radius = self.planning_circle(obs)
+        radial = distance(pos, center)
+        if radial < 1 or (radius - radial >= 85 and radius - distance(goal, center) >= 35):
+            return goal
+        out = bearing(center, pos)
+        away = threat + math.pi
+        track = max(0, radius - min(35, radius * 0.45))
+        advance = min(40, max(4, track * 0.65))
+        candidates = {}
+        locked = now < self.orbit_until
+        sides = (self.orbit_side,) if locked else (self.turn_side, -self.turn_side)
+        for side in sides:
+            yaw = out + side * math.pi / 2
+            dx, dy = math.cos(yaw), math.sin(yaw)
+            angle = out + side * advance / max(track, 1)
+            step_radius = max(0, min(track, radial + 8))
+            point = (center[0] + step_radius * math.cos(angle),
+                     center[1] + step_radius * math.sin(angle))
+            if locked:
+                return point
+            step = bearing(pos, point)
+            walkway = sum(self.arena.walkable(me, step, reach) for reach in (8, 20, 40))
+            crowd = sum(max(0, 1 - distance((pos[0] + dx * 40, pos[1] + dy * 40), enemy["pos"]) / 40)
+                        for enemy in enemies)
+            score = math.cos(angle_error(step, away)) + 0.55 * walkway - crowd
+            candidates[side] = (score, point)
+        self.orbit_side = max(candidates, key=lambda side: candidates[side][0])
+        self.orbit_until = now + 6
+        return candidates[self.orbit_side][1]
 
     def weave_side(self, now):
         return self.turn_side * (-1 if int((now + self.weave_offset) / 0.78) % 2 else 1)
@@ -1028,6 +1064,7 @@ class Bot:
             ):
                 away = threat_bearing + math.pi + 0.33 * self.weave_side(now)
                 goal = (pos[0] + 40 * math.cos(away), pos[1] + 40 * math.sin(away))
+                goal = self.orbit_goal(obs, goal, enemies, threat_bearing)
             elif opening:
                 developing = True
                 resources = self.resource_goal(obs, loot, enemies, opening=True)
@@ -1050,6 +1087,10 @@ class Bot:
                 if not disengage and len(active_enemies) <= 1:
                     peek_plan = self.cover_peek(obs, target)
                 goal = peek_plan[0] if peek_plan else self.kite_goal(me, target, tactics, now, zone["radius"])
+                if peek_plan is None:
+                    facing = bearing(pos, target["pos"])
+                    if math.cos(angle_error(bearing(pos, goal), facing)) < -1e-6:
+                        goal = self.orbit_goal(obs, goal, enemies, facing)
             elif not disengage:
                 cubes = [c for c in obs["cubes"] if abs(c["pos"][2] - pos[2]) < 4]
                 cap = self.config["cubes"]["stat_cap"] if not self.pvp else 6
