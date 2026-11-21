@@ -172,7 +172,10 @@ class StaticRoutes:
         self.steps += 1
         pos = me["pos"]
         goal = tuple(goal[:2])
-        if math.dist(pos[:2], goal) < 6 or self.clear_grid_line(pos, goal):
+        distance = math.dist(pos[:2], goal)
+        yaw = math.atan2(goal[1] - pos[1], goal[0] - pos[0])
+        if (distance < 6 or self.clear_grid_line(pos, goal)
+                or self.arena.walkable(me, yaw, distance)):
             self.path.clear()
             return goal
 

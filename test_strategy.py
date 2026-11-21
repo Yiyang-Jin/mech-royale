@@ -33,15 +33,12 @@ class StrategyTests(unittest.TestCase):
         self.assertAlmostEqual(intercept((100, 0, 0), (10, 0, 0), 100, 4), 96 / 90)
         self.assertIsNone(intercept((100, 0, 0), (110, 0, 0), 100))
 
-    def test_only_unexplained_early_death_changes_mode(self):
+    def test_unexplained_deaths_do_not_change_practice_mode(self):
         bot = Bot(self.hello)
         obs = deepcopy(self.replay[0])
-        obs.update(alive=15, t=10, events=[{"type": "kill", "target": 8}], beams=[])
-        bot.update_situation(obs, [])
+        obs.update(alive=12, t=20, events=[])
+        bot.update_situation(obs)
         self.assertFalse(bot.pvp)
-        obs.update(alive=14, t=20, events=[])
-        bot.update_situation(obs, [])
-        self.assertTrue(bot.pvp)
 
     def test_projectile_approach_and_height(self):
         bot = Bot(self.hello)

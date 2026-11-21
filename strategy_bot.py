@@ -76,11 +76,6 @@ class Bot:
         match = self.config["match"]
         self.physics_step = 1 / match["tick_hz"]
         self.turn_step = match["decide_every"] * self.physics_step
-        self.alive = match["mechs"]
-        self.starting_alive = self.alive
-        self.first_shrink = self.config["zone"]["phases"][0]["hold_s"]
-        self.kills = set()
-        self.other_fight_until = {}
         self.last_combat = -math.inf
         self.last_damage_bearing = None
         self.last_damage = -math.inf
@@ -97,41 +92,15 @@ class Bot:
         self.roof_deadline = -math.inf
         self.roof_retry = -math.inf
 
-    def update_situation(self, obs, enemies):
+    def update_situation(self, obs):
         now = obs["t"]
         for event in obs["events"]:
             kind = event["type"]
-            if kind in ("damaged", "hit"):
-                self.last_combat = now
-            if kind == "kill":
-                self.kills.add(event["target"])
+            if kind in ("damaged", "hit", "kill"):
                 self.last_combat = now
             if kind == "damaged" and event["bearing"] is not None:
                 self.last_damage_bearing = event["bearing"]
                 self.last_damage = now
-        # Zone deaths can also happen in practice, so use early deaths only.
-        if (obs["alive"] < self.alive and now < self.first_shrink
-                and self.starting_alive - obs["alive"] > len(self.kills)):
-            self.pvp = True
-        self.alive = obs["alive"]
-        own = obs["self"]["pos"]
-        for beam in obs["beams"]:
-            source = beam["by"]
-            for point in beam["path"][1:]:
-                # A beam ending near us is ambiguous even when another mech is nearby.
-                if distance(point, own) < obs["self"]["stats"]["radius"] + 6:
-                    continue
-                for enemy in enemies:
-                    if enemy["id"] == source:
-                        continue
-                    pos = enemy["pos"]
-                    size = 1 + self.config["cubes"]["size_per_cube"] * enemy.get("cubes", 0)
-                    stats = self.config["mech"]
-                    if (distance(point, pos) <= stats["radius"] * size + 1
-                            and pos[2] - 1 <= point[2] <= pos[2] + stats["height"] * size + 1):
-                        self.pvp = True
-                        self.other_fight_until[enemy["id"]] = now + 3
-                        self.other_fight_until[source] = now + 3
 
     def aim(self, me, target, weapon):
         kind, stats = weapon["kind"], weapon["stats"]
@@ -545,7 +514,7 @@ class Bot:
         now = obs["t"]
         enemies = sorted((a for a in obs["mechs"] if a["kind"] == "mech"),
                          key=lambda a: distance(pos, a["pos"]))
-        self.update_situation(obs, enemies)
+        self.update_situation(obs)
         hp = me["hp"] / me["max_hp"]
         tactics = self.free_for_all if self.pvp else self.practice
         if hp < tactics.retreat_hp:
@@ -565,8 +534,7 @@ class Bot:
             distance(pos, a["pos"]) + 75 * a.get("hp", 1400) / a.get("max_hp", 1400)
         )) if not self.pvp or distance(pos, e["pos"]) < 40
             or (recently_hit and abs(angle_error(bearing(pos, e["pos"]), self.last_damage_bearing)) < 0.5)
-            or e.get("hp", math.inf) < 0.26 * e.get("max_hp", 1400)
-            or self.other_fight_until.get(e["id"], -1) > now), None)
+            or e.get("hp", math.inf) < 0.26 * e.get("max_hp", 1400)), None)
         if disengage:
             # Only shoot through recovery when a close attacker can still hit us.
             target = None
