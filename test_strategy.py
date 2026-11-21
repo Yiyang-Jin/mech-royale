@@ -199,6 +199,40 @@ class StrategyTests(unittest.TestCase):
             self.assertEqual(bot.upgrade_choice(me, offer, 120), chosen)
             offer["choices"].pop()
 
+    def test_supply_drop_is_approached_before_landing_and_held_in_ring(self):
+        bot = Bot(self.hello)
+        obs = deepcopy(self.replay[0])
+        me = obs["self"]
+        x, y, z = me["pos"]
+        obs["zone"].update(center=[x, y], next_center=[x, y], radius=400, next_radius=320,
+                           shrink_start=140, shrink_end=180)
+        drop = {"id": 20000, "pos": [x + 100, y, z], "radius": 8, "lands_in": 8,
+                "holder": None, "progress": 0, "capture_s": 4}
+        obs.update(t=87, drops=[drop], mechs=[], projectiles=[], sounds=[])
+        with patch.object(bot.arena, "walkable", return_value=True):
+            action = bot.act(obs)
+            self.assertGreater(action["move"][0], 0.9)
+            self.assertTrue(action["boost"])
+        me["pos"] = drop["pos"].copy()
+        drop.update(lands_in=0, holder=me["id"])
+        obs["t"] = 96
+        self.assertNotIn("move", bot.act(obs))
+
+    def test_supply_drop_targets_occupant_and_avoids_two_enemies(self):
+        bot = Bot(self.hello)
+        obs = deepcopy(self.replay[0])
+        x, y, z = obs["self"]["pos"]
+        drop = {"id": 20000, "pos": [x + 30, y, z], "radius": 8, "lands_in": 0,
+                "holder": 12, "progress": 1, "capture_s": 4}
+        occupant = {"id": 12, "kind": "mech", "pos": drop["pos"], "aim": [0, 0]}
+        guard = {"id": 13, "kind": "mech", "pos": [x + 38, y, z], "aim": [0, 0]}
+        obs.update(drops=[drop], mechs=[occupant], projectiles=[], sounds=[])
+        self.assertEqual(bot.choose_supply_drop(obs, [occupant]), (drop, occupant))
+        with patch.object(bot, "attack") as attack:
+            bot.act(obs)
+            self.assertEqual(attack.call_args.args[1], occupant)
+        self.assertIsNone(bot.choose_supply_drop(obs, [occupant, guard]))
+
     def test_kiting_reverses_tangent_without_giving_up_range(self):
         bot = Bot(self.hello)
         me = deepcopy(self.replay[0]["self"])

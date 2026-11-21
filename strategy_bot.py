@@ -631,6 +631,25 @@ class Bot:
                 candidates.append(item)
         return min(candidates, key=lambda item: distance(pos, item["pos"]), default=None)
 
+    def choose_supply_drop(self, obs, enemies):
+        pos = obs["self"]["pos"]
+        if sum(distance(pos, e["pos"]) < 40 for e in enemies) > 1:
+            return None
+        for drop in sorted(obs["drops"], key=lambda d: distance(pos, d["pos"])):
+            if drop["lands_in"] >= 10 or distance(pos, drop["pos"]) >= 180:
+                continue
+            center = drop["pos"][:2]
+            if distance(center, self.safe_destination(obs, center)) >= drop["radius"] - 1:
+                continue
+            nearby = [e for e in enemies if distance(center, e["pos"]) < 40]
+            if len(nearby) > 1:
+                continue
+            opponent = next((e for e in nearby
+                             if distance(center, e["pos"]) <= drop["radius"]
+                             or e["id"] == drop["holder"]), None)
+            return drop, opponent
+        return None
+
     def act(self, obs: mf.Observation) -> mf.Action:
         me = obs["self"]
         pos = me["pos"]
@@ -682,6 +701,7 @@ class Bot:
         goal = zone_goal
         quiet = False
         rushing = False
+        supply = None
         recover_covered = (self.recovering and me["grounded"] and not recently_hit
                            and self.covered_for_recovery(me, enemies, tactics))
         if not urgent_zone:
@@ -690,11 +710,20 @@ class Bot:
                     else None)
             if not self.pvp and not disengage and not recently_hit and near_dist > 42:
                 resources = self.resource_goal(obs, loot, enemies)
-            drops = [d for d in obs["drops"] if d["lands_in"] == 0 and d["holder"] in (None, me["id"])
-                     and hp < 0.78 and not enemies and not recently_hit
-                     and distance(pos, d["pos"]) < 42]
-            if drops:
-                goal = min(drops, key=lambda d: distance(pos, d["pos"]))["pos"][:2]
+            supply = self.choose_supply_drop(obs, enemies)
+            if supply is not None:
+                drop, opponent = supply
+                center = drop["pos"][:2]
+                gap = distance(pos, center)
+                if opponent is not None:
+                    target = opponent
+                    goal = self.kite_goal(me, opponent, tactics, now)
+                elif drop["holder"] not in (None, me["id"]):
+                    yaw = bearing(center, pos)
+                    edge = drop["radius"] + 4
+                    goal = (center[0] + math.cos(yaw) * edge, center[1] + math.sin(yaw) * edge)
+                else:
+                    goal = pos[:2] if gap <= drop["radius"] - 1 else center
             elif recover_covered:
                 goal = zone_goal
             elif threat_bearing is not None and (disengage or (self.pvp and target is None and near_dist < 70)):
@@ -725,7 +754,8 @@ class Bot:
                         goal = target["pos"][:2]
                 elif self.pvp and near_dist > 70:
                     quiet = True
-        if distance(pos, goal) < 2 and target is None and not disengage and not self.pvp and not rushing:
+        if (distance(pos, goal) < 2 and target is None and not disengage
+                and not self.pvp and not rushing and supply is None):
             goal = self.scout_goal(obs)
         goal = self.safe_destination(obs, goal)
         # Dash back across the current circle boundary before pursuing the next circle.
@@ -740,7 +770,7 @@ class Bot:
         if nearest and disengage and not urgent_zone and dodge is None:
             tx, ty, tz = nearest["pos"]
             cover_from = (tx, ty, tz + self.config["mech"]["muzzle_height"])
-        roof_needed = (not self.pvp and not recover_covered and near_dist < 110
+        roof_needed = (supply is None and not self.pvp and not recover_covered and near_dist < 110
                        and (self.recovering or len(active_enemies) >= 2))
         climbing = self.roof_escape(obs, active_enemies, action, roof_needed, urgent_zone)
         if climbing:
@@ -751,12 +781,16 @@ class Bot:
             if (rushing and dodge is None and me["grounded"] and distance(pos, goal) > 2 * self.pickup_radius
                     and math.hypot(*action.get("move", (0, 0))) > 0.25):
                 action["boost"] = me["energy"] - me["stats"]["boost_drain"] * self.turn_step >= 30
+            elif (supply is not None and supply[1] is None and dodge is None and me["grounded"]
+                    and distance(pos, goal) > 24 and math.hypot(*action.get("move", (0, 0))) > 0.25):
+                action["boost"] = me["energy"] - me["stats"]["boost_drain"] * self.turn_step >= 30
 
         if threat_bearing is None:
             self.scan = math.remainder(self.scan + 0.055, math.tau)
             sound = self.sound_direction(obs)
-            look = self.scan if sound is None else sound
+            look = self.scan if supply is None else bearing(pos, supply[0]["pos"])
             if sound is not None:
+                look = sound
                 target = None
         else:
             self.sound_until = -math.inf
@@ -768,7 +802,8 @@ class Bot:
             action["reload"] = gun["ammo"] == 0 or (target is None and (near_dist > 65 or disengage))
         mode = "FFA" if self.pvp else "practice"
         recovering = self.recovering and now - self.last_combat >= me["stats"]["regen_delay"]
-        state = "roof" if climbing else "healing" if recovering else "retreat" if disengage else "active"
+        state = ("roof" if climbing else "supply" if supply else "healing" if recovering
+                 else "retreat" if disengage else "active")
         mf.draw.label(f"{mode} | {state}")
         return action
 
