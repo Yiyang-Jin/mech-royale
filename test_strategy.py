@@ -8,6 +8,7 @@ import unittest
 from unittest.mock import patch
 
 from arena_geometry import Prism, RoofEntry
+from canary_bot import GroundCanary
 from strategy_bot import Bot, PRACTICE, intercept
 
 
@@ -245,11 +246,29 @@ class StrategyTests(unittest.TestCase):
             goal = bot.orbit_goal(obs, (-224, 0), [enemy], 0)
         self.assertGreater(goal[1], 30)
         self.assertEqual(bot.safe_destination(obs, goal), goal)
-        with patch.object(bot.arena, "walkable", side_effect=lambda me, yaw, reach: math.sin(yaw) < 0):
+        with (patch.object(bot.arena, "walkable", side_effect=lambda me, yaw, reach: math.sin(yaw) < 0),
+              patch.object(bot, "orbit_node", side_effect=lambda me, point, accepts: point if accepts(point) else None)):
             obs["t"] = 85.9
             self.assertEqual(bot.orbit_goal(obs, (-224, 0), [enemy], 0), goal)
             obs["t"] = 86
             self.assertLess(bot.orbit_goal(obs, (-224, 0), [enemy], 0)[1], -30)
+
+    def test_orbit_starts_at_map_edge_inside_wide_circle_and_snaps_to_grid(self):
+        bot = GroundCanary(self.hello)
+        obs = deepcopy(self.replay[0])
+        bounds = bot.arena.bounds
+        cx, cy = (bounds["minX"] + bounds["maxX"]) / 2, (bounds["minY"] + bounds["maxY"]) / 2
+        obs["zone"].update(center=[cx, cy], next_center=[cx, cy], radius=900, next_radius=900)
+        obs["t"] = 20
+        for x in (bounds["minX"] + 23, bounds["maxX"] - 23):
+            obs["self"]["pos"] = [x, cy, bot.arena.ground(x, cy)]
+            original = (x + (40 if x > cx else -40), cy)
+            goal = bot.orbit_goal(obs, original, [{"pos": [cx, cy, 0]}], 0)
+            self.assertGreater(abs(goal[1] - cy), 20)
+            self.assertGreaterEqual(goal[0], bounds["minX"] + 18)
+            self.assertLessEqual(goal[0], bounds["maxX"] - 18)
+            node = bot.static_routes.node_at(*bot.static_routes.indices(goal))
+            self.assertEqual(bot.static_routes.xyz[node][:2], goal)
 
     def test_kiting_reverses_tangent_without_giving_up_range(self):
         bot = Bot(self.hello)

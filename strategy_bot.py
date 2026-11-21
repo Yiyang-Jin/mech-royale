@@ -423,24 +423,69 @@ class Bot:
         me = obs["self"]
         pos, now = me["pos"], obs["t"]
         center, radius = self.planning_circle(obs)
-        radial = distance(pos, center)
-        if radial < 1 or (radius - radial >= 85 and radius - distance(goal, center) >= 35):
+        bounds = self.arena.bounds
+        left, right = bounds["minX"] + 18, bounds["maxX"] - 18
+        bottom, top = bounds["minY"] + 18, bounds["maxY"] - 18
+
+        def margin(point):
+            x, y = point[:2]
+            return min(radius - distance(center, point), x - left, right - x, y - bottom, top - y)
+
+        if margin(pos) >= 85 and margin(goal) >= 35:
             return goal
-        out = bearing(center, pos)
+        anchor = (max(left, min(right, center[0])), max(bottom, min(top, center[1])))
+        room = radius - distance(center, anchor)
+        if room <= 0:
+            return goal
+        # Move the projected center just inside the rectangle without leaving the disk.
+        middle = ((left + right) / 2, (bottom + top) / 2)
+        nudge = min(0.02, room / (2 * max(1, distance(anchor, middle))))
+        ox, oy = origin = tuple(a + (m - a) * nudge for a, m in zip(anchor, middle))
+        offset_x, offset_y = ox - center[0], oy - center[1]
+        if distance(origin, pos) < 1:
+            return goal
+
+        def track(angle):
+            dx, dy = math.cos(angle), math.sin(angle)
+            cross_x = ((right if dx > 0 else left) - ox) / dx if abs(dx) > 1e-9 else math.inf
+            cross_y = ((top if dy > 0 else bottom) - oy) / dy if abs(dy) > 1e-9 else math.inf
+            projection = offset_x * dx + offset_y * dy
+            cross_circle = -projection + math.sqrt(
+                max(0, projection * projection + radius * radius - offset_x ** 2 - offset_y ** 2)
+            )
+            edge = min(cross_x, cross_y, cross_circle)
+            return edge - min(35, edge * 0.45)
+
+        def accepts(point):
+            return (left <= point[0] <= right and bottom <= point[1] <= top
+                    and distance(point, center) <= max(0, radius - 16) and distance(pos, point) >= 4)
+
+        out = bearing(origin, pos)
         away = threat + math.pi
-        track = max(0, radius - min(35, radius * 0.45))
-        advance = min(40, max(4, track * 0.65))
+        advance = min(math.pi / 2, 42 / max(track(out), 1))
         candidates = {}
         locked = now < self.orbit_until
-        sides = (self.orbit_side,) if locked else (self.turn_side, -self.turn_side)
+        first = self.orbit_side if locked else self.turn_side
+        sides = (first, -first)
         for side in sides:
             yaw = out + side * math.pi / 2
             dx, dy = math.cos(yaw), math.sin(yaw)
-            angle = out + side * advance / max(track, 1)
-            step_radius = max(0, min(track, radial + 8))
-            point = (center[0] + step_radius * math.cos(angle),
-                     center[1] + step_radius * math.sin(angle))
+            angle = out + side * advance
+            step_radius = track(angle)
+            point = None
+            for attempt in range(6):
+                radial = step_radius - attempt * 12
+                if radial <= 0:
+                    break
+                candidate = (ox + radial * math.cos(angle), oy + radial * math.sin(angle))
+                point = self.orbit_node(me, candidate, accepts)
+                if point is not None:
+                    break
+            if point is None:
+                continue
             if locked:
+                if side != self.orbit_side:
+                    self.orbit_side, self.orbit_until = side, now + 6
                 return point
             step = bearing(pos, point)
             walkway = sum(self.arena.walkable(me, step, reach) for reach in (8, 20, 40))
@@ -448,9 +493,17 @@ class Bot:
                         for enemy in enemies)
             score = math.cos(angle_error(step, away)) + 0.55 * walkway - crowd
             candidates[side] = (score, point)
+        if not candidates:
+            return goal
         self.orbit_side = max(candidates, key=lambda side: candidates[side][0])
         self.orbit_until = now + 6
         return candidates[self.orbit_side][1]
+
+    def orbit_node(self, me, point, accepts):
+        gap = distance(me["pos"], point)
+        if accepts(point) and self.arena.walkable(me, bearing(me["pos"], point), gap):
+            return point
+        return None
 
     def weave_side(self, now):
         phase = (now + self.weave_offset) % 1.05
