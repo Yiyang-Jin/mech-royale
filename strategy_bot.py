@@ -98,6 +98,11 @@ class Bot:
         self.pvp = False
         self.recovering = False
         self.uncovered_since = None
+        self.cover_scan_cursor = 0
+        self.recovery_waypoint = None
+        self.pillar_memory = None
+        self.pillar_memory_until = -math.inf
+        self.pillar_blocker = None
         self.frame_time = 0.0
         self.collect_until = -math.inf
         self.laser_full_since = None
@@ -507,23 +512,35 @@ class Bot:
     def pillar_goal(self, obs, enemies):
         me = obs["self"]
         pos = me["pos"]
+        now = obs["t"]
         pursuers = [e for e in enemies if distance(pos, e["pos"]) <= 80]
-        if not pursuers:
+        if pursuers:
+            start, end = next(self.recovery_sightlines(me, pursuers[0]))
+            nearby = dict.fromkeys(p for cell in cells(min(start[0], end[0]), min(start[1], end[1]),
+                                                      max(start[0], end[0]), max(start[1], end[1]))
+                                   for p in self.arena.bins.get(cell, ()))
+            pillars = []
+            for prism in nearby:
+                if prism.kind in ("building", "bridge", "stadium") and prism.intersects(start, end):
+                    left, bottom, right, top = prism.bounds
+                    center = ((left + right) / 2, (bottom + top) / 2)
+                    pillars.append((distance(pos, center), center, prism))
+            self.pillar_blocker = min(pillars, key=lambda item: item[0])[1:] if pillars else None
+            self.pillar_memory = tuple(sum(e["pos"][i] for e in pursuers) / len(pursuers) for i in range(2))
+            self.pillar_memory_until = now + 6
+        elif self.pillar_blocker is not None and now < self.pillar_memory_until:
+            sound = min((s for s in obs["sounds"] if s["dist"] == "near" and s["age"] <= 0.6
+                         and s["kind"] in ("step", "boost", "laser_charge")),
+                        key=lambda s: s["age"], default=None)
+            if sound is not None:
+                angle = sound["bearing"]
+                self.pillar_memory = (pos[0] + 30 * math.cos(angle), pos[1] + 30 * math.sin(angle))
+        else:
             return None
-        start, end = next(self.recovery_sightlines(me, pursuers[0]))
-        nearby = dict.fromkeys(p for cell in cells(min(start[0], end[0]), min(start[1], end[1]),
-                                                  max(start[0], end[0]), max(start[1], end[1]))
-                               for p in self.arena.bins.get(cell, ()))
-        pillars = []
-        for prism in nearby:
-            if prism.kind in ("building", "bridge") and prism.intersects(start, end):
-                left, bottom, right, top = prism.bounds
-                center = ((left + right) / 2, (bottom + top) / 2)
-                pillars.append((distance(pos, center), center, prism))
-        if not pillars:
+        if self.pillar_blocker is None:
             return None
-        _, center, pillar = min(pillars, key=lambda item: item[0])
-        centroid = tuple(sum(e["pos"][i] for e in pursuers) / len(pursuers) for i in range(2))
+        center, pillar = self.pillar_blocker
+        centroid = self.pillar_memory
         if distance(center, centroid) < 1 or distance(center, pos) < 1:
             return None
         away = bearing(centroid, center)
@@ -533,7 +550,7 @@ class Bot:
             return None
         tangent = radial + math.copysign(math.pi / 2, error)
         safe_goal, best_error = None, abs(error) - 0.03
-        for offset in (0, 30, -30, 60, -60):
+        for offset in (0, 28, -28, 56, -56, 82, -82):
             yaw = tangent + math.radians(offset)
             dx, dy = math.cos(yaw), math.sin(yaw)
             point = (pos[0] + dx * 6, pos[1] + dy * 6)
@@ -545,12 +562,15 @@ class Bot:
                 z = self.arena.ground(x, y)
                 next_me = dict(me, pos=(x, y, z))
                 if (abs(z - pos[2]) > me["stats"]["step_up"]
-                        or not all(pillar.intersects(a, b) for a, b in self.recovery_sightlines(next_me, pursuers[0]))
+                        or (pursuers and not all(pillar.intersects(a, b)
+                                for a, b in self.recovery_sightlines(next_me, pursuers[0])))
                         or not self.covered_for_recovery(next_me, enemies)):
                     break
             else:
                 safe_goal, best_error = point, gap
-        return safe_goal
+        boost = bool(pursuers and distance(pos, pursuers[0]["pos"]) < 28 and abs(error) > 0.45
+                     and me["energy"] > 35)
+        return (safe_goal, boost) if safe_goal is not None else None
 
     def move(self, me, goal, action, dodge, hurry, quiet, cover_from=None):
         d = distance(me["pos"], goal)
@@ -961,18 +981,38 @@ class Bot:
     def recovery_cover(self, obs, enemies, away):
         me = obs["self"]
         x, y, z = me["pos"]
-        for gap in (12, 22, 32):
-            for offset in (0, 40, -40, 80, -80, 120, -120):
-                yaw = away + self.turn_side * math.radians(offset)
-                point = (x + gap * math.cos(yaw), y + gap * math.sin(yaw))
-                height = self.arena.ground(*point)
-                if (distance(point, self.safe_destination(obs, point)) > 1
-                        or abs(height - z) > gap * math.tan(math.radians(me["stats"]["max_slope_deg"]))):
-                    continue
-                landing = dict(me, pos=(*point, height))
-                if (self.arena.walkable(landing, yaw, me["stats"]["radius"])
-                        and self.isolated(me, landing["pos"], enemies)):
-                    return point
+        slope = math.tan(math.radians(me["stats"]["max_slope_deg"]))
+
+        def usable(point, gap, yaw):
+            height = self.arena.ground(*point)
+            if (distance(point, self.safe_destination(obs, point)) > 1
+                    or abs(height - z) > gap * slope):
+                return False
+            landing = dict(me, pos=(*point, height))
+            return (self.covered_for_recovery(landing, enemies)
+                    and self.arena.walkable(landing, yaw, me["stats"]["radius"]))
+
+        deadline = perf_counter() + 0.003
+        if self.recovery_waypoint is not None:
+            point = self.recovery_waypoint
+            gap = distance(me["pos"], point)
+            if 2 <= gap <= 32 and usable(point, gap, bearing(me["pos"], point)):
+                return point
+            self.recovery_waypoint = None
+        offsets = (0, 23, -23, 46, -46, 69, -69, 92, -92, 115, -115)
+        for index in range(self.cover_scan_cursor, 3 * len(offsets)):
+            if index > self.cover_scan_cursor and perf_counter() >= deadline:
+                self.cover_scan_cursor = index
+                return None
+            ring, angle = divmod(index, len(offsets))
+            gap = (12, 22, 32)[ring]
+            yaw = away + self.turn_side * math.radians(offsets[angle])
+            point = (x + gap * math.cos(yaw), y + gap * math.sin(yaw))
+            if usable(point, gap, yaw):
+                self.cover_scan_cursor = 0
+                self.recovery_waypoint = point
+                return point
+        self.cover_scan_cursor = 0
         return None
 
     def cover_peek(self, obs, target, others=(), corner=None):
@@ -1073,6 +1113,9 @@ class Bot:
             self.recovering = True
         if hp >= tactics.recover_hp:
             self.recovering = False
+        if not self.recovering:
+            self.pillar_memory = self.pillar_blocker = None
+            self.pillar_memory_until = -math.inf
 
         nearest = enemies[0] if enemies else None
         near_dist = distance(pos, nearest["pos"]) if nearest else math.inf
@@ -1098,9 +1141,23 @@ class Bot:
             self.uncovered_since = None
         elif self.uncovered_since is None:
             self.uncovered_since = now
-        recovery_stalled = self.uncovered_since is not None and now - self.uncovered_since >= 2.5
-        exposed_close = [e for e in enemies if distance(pos, e["pos"]) <= 45 and self.recovery_exposed(me, e)
-                         ] if recovery_stalled else []
+        uncovered_for = now - self.uncovered_since if self.uncovered_since is not None else 0
+        zone = obs["zone"]
+        zone_goal = self.safe_destination(obs, pos[:2])
+        urgent_zone = not me["in_zone"] or distance(pos, zone_goal) > me["stats"]["walk_speed"] * max(
+            2, zone["shrink_end"] - now - 7
+        )
+        recovery_route = None
+        if (not urgent_zone and self.recovering and not recover_covered
+                and threat_bearing is not None and me["grounded"]):
+            recovery_route = self.recovery_cover(obs, enemies, threat_bearing + math.pi)
+        else:
+            self.cover_scan_cursor = 0
+            self.recovery_waypoint = None
+        recovery_stalled = uncovered_for >= 2.5 and not self.cover_scan_cursor
+        exposed_close = []
+        if not urgent_zone and recovery_route is None and not self.cover_scan_cursor and uncovered_for >= 2:
+            exposed_close = [e for e in enemies if distance(pos, e["pos"]) <= 45 and self.recovery_exposed(me, e)]
         fight_close = bool(exposed_close)
         if fight_close and target not in exposed_close:
             target = self.select_target(me, exposed_close)
@@ -1119,19 +1176,14 @@ class Bot:
         if "drop" in action and "take" not in action:
             me = dict(me, weapons=list(me["weapons"]))
             me["weapons"][action["drop"]] = None
-        zone = obs["zone"]
-        zone_goal = self.safe_destination(obs, pos[:2])
-        urgent_zone = not me["in_zone"] or distance(pos, zone_goal) > me["stats"]["walk_speed"] * max(
-            2, zone["shrink_end"] - now - 7
-        )
 
         goal = zone_goal
         quiet = False
         developing = False
         peek_plan = None
         corner = None
-        recovery_route = None
         pillar_step = None
+        pillar_boost = False
         supply = None
         cube_reach = self.cube_reach(me, 42)
         kill_cubes = [cube for cube in obs["cubes"] if now < self.collect_until and near_dist >= 45
@@ -1141,9 +1193,8 @@ class Bot:
             resources = None
             if not opening and not self.pvp and not disengage and not recently_hit and near_dist > 42:
                 resources = self.resource_goal(obs, loot, enemies)
-            if recovery_stalled and near_dist > 45 and threat_bearing is not None and me["grounded"]:
-                recovery_route = self.recovery_cover(obs, enemies, threat_bearing + math.pi)
-            if not recover_covered and not quick_finish and not recovery_stalled:
+            if (not recover_covered and recovery_route is None and not self.cover_scan_cursor
+                    and not fight_close and not quick_finish and not recovery_stalled):
                 supply = self.choose_supply(obs, enemies)
             others = [e for e in active_enemies if target is not None and e["id"] != target["id"]]
             if (supply is None and recovery_route is None and not fight_close
@@ -1157,14 +1208,16 @@ class Bot:
                         corner = self.corner_position(obs, target, others, weapon)
                 peek_plan = self.cover_peek(obs, target, others, corner)
             if recover_covered:
-                pillar_step = self.pillar_goal(obs, enemies)
-                goal = pillar_step if pillar_step is not None else zone_goal
+                pillar = self.pillar_goal(obs, enemies)
+                if pillar is not None:
+                    pillar_step, pillar_boost = pillar
+                    goal = pillar_step
+            elif recovery_route is not None:
+                goal = recovery_route
+                execute = False
             elif fight_close:
                 yaw = bearing(pos, target["pos"]) + self.weave_side(now) * math.pi / 2
                 goal = (pos[0] + 24 * math.cos(yaw), pos[1] + 24 * math.sin(yaw))
-                execute = False
-            elif recovery_route is not None:
-                goal = recovery_route
                 execute = False
             elif quick_finish:
                 goal = self.kite_goal(me, target, tactics, now, zone["radius"], execute=True)
@@ -1274,7 +1327,7 @@ class Bot:
         if pillar_step is not None and dodge is None:
             yaw = bearing(pos, goal)
             action["move"] = [math.cos(yaw), math.sin(yaw)]
-            action["boost"] = False
+            action["boost"] = pillar_boost
         else:
             self.move(me, goal, action, dodge, urgent_zone or (escaping and near_dist < 95),
                       quiet and dodge is None and not urgent_zone, cover_from if escaping else None)

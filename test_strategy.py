@@ -331,6 +331,27 @@ class StrategyTests(unittest.TestCase):
         self.assertFalse(action["boost"])
         self.assertLess(action["move"][1], -0.8)
 
+    def test_stadium_pillar_motion_continues_after_observation_expires(self):
+        bot = Bot(self.hello)
+        obs = deepcopy(self.replay[0])
+        obs["self"].update(hp=600, pos=[-15, 5, 0], grounded=True)
+        obs["zone"].update(center=[0, 0], next_center=[0, 0], radius=400, next_radius=320)
+        enemy = {"id": 12, "kind": "mech", "pos": [23, 4, 0], "aim": [0, 0]}
+        prism = Prism({"kind": "stadium", "base": -1, "top": 18,
+                       "ring": [-8, -9, 8, -9, 8, 9, -8, 9], "holes": []})
+        obs.update(t=95, drops=[], projectiles=[], beams=[], sounds=[], mechs=[enemy], events=[])
+        with (patch.object(bot.arena, "bins", {cell: [prism] for cell in cells(*prism.bounds)}),
+              patch.object(bot.arena, "ground", return_value=0)):
+            self.assertLess(bot.act(obs)["move"][1], -0.8)
+            obs.update(t=100.1, mechs=[], sounds=[{"kind": "step", "dist": "near", "age": 0, "bearing": 0}])
+            action = bot.act(obs)
+            self.assertLess(action["move"][1], -0.8)
+            self.assertEqual(action["fire"], [False, False])
+            self.assertFalse(action["boost"])
+            self.assertEqual(bot.pillar_memory, (15, 5))
+            obs.update(t=101, sounds=[])
+            self.assertNotIn("move", bot.act(obs))
+
     def test_full_laser_waits_for_visible_ray_but_releases_after_grace_or_near_lightning(self):
         bot = Bot(self.hello)
         me = deepcopy(self.replay[0]["self"])
@@ -541,29 +562,33 @@ class StrategyTests(unittest.TestCase):
         self.assertEqual(action["fire"], [False, False])
         roof.assert_not_called()
 
-    def test_stalled_recovery_boosts_to_cover_then_fights_a_close_pursuer(self):
+    def test_recovery_searches_on_entry_and_fights_close_after_two_seconds_without_cover(self):
         bot = Bot(self.hello)
         obs = deepcopy(self.replay[0])
         x, y, z = obs["self"]["pos"]
         obs["self"].update(hp=500, energy=60, grounded=True)
         obs["zone"].update(center=[x, y], next_center=[x, y], radius=400, next_radius=320)
-        foe = {"id": 12, "kind": "mech", "pos": [x + 60, y, z], "hp": 1000, "aim": [0, 0]}
+        foe = {"id": 12, "kind": "mech", "pos": [x + 40, y, z], "hp": 1000, "aim": [0, 0]}
         obs.update(t=95, drops=[], projectiles=[], beams=[], sounds=[], events=[], mechs=[foe])
         with (patch.object(bot, "covered_for_recovery", return_value=False),
               patch.object(bot, "recovery_exposed", return_value=True),
               patch.object(bot, "recovery_cover", return_value=(x - 22, y)) as cover,
               patch.object(bot.arena, "walkable", return_value=True)):
-            bot.act(obs)
-            cover.assert_not_called()
-            obs["t"] = 97.5
+            action = bot.act(obs)
+            cover.assert_called_once()
+            self.assertTrue(action["boost"])
+            self.assertLess(action["move"][0], -0.9)
+            obs["t"] = 97
             action = bot.act(obs)
             self.assertTrue(action["boost"])
             self.assertLess(action["move"][0], -0.9)
-            foe["pos"][0] = x + 40
+            cover.return_value = None
+            bot.cover_scan_cursor = 11
+            self.assertLess(bot.act(obs)["move"][0], -0.85)
+            bot.cover_scan_cursor = 0
             action = bot.act(obs)
             self.assertFalse(action["boost"])
             self.assertGreater(abs(action["move"][1]), 0.9)
-            cover.assert_called_once()
 
     def test_stalled_recovery_counterattack_uses_exposed_pursuer(self):
         bot = Bot(self.hello)
