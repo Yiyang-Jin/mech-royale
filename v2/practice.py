@@ -7,7 +7,7 @@ from probe_bot import CloseFightProbe
 from strategy_bot import Bot
 
 
-VARIANTS = ("p406", "retreat56", "range92-retreat45", "laser-cover")
+VARIANTS = ("p406", "retreat56", "range92-retreat45", "laser-cover", "clear-waves")
 
 
 class PracticeBot(LaserCoverBot):
@@ -17,6 +17,7 @@ class PracticeBot(LaserCoverBot):
         self.static_routes.path = copy(routes.path)
         self.world = world
         self.variant = variant
+        self.clear_waves = variant == "clear-waves"
         self.gun_target = None
         self.enable_laser_cover()
         distance, retreat = {"retreat56": (78, .56), "range92-retreat45": (92, .45)}.get(variant, (78, .38))

@@ -86,6 +86,8 @@ class Simulation:
         self.death_audit = None
         self.medium_gun_shots = 0
         self.medium_gun_hits = 0
+        self.engaged_at = {}
+        self.player_kills = []
         self.rng = random.Random(seed)
         self.capture = capture
         self.director = SquadDirector(waves)
@@ -420,6 +422,11 @@ class Simulation:
                         target.laser_lock=self.t+self.cfg["weapons"]["lightning"]["short_s"]
             before_hp = target.hp
             target.hp -= amount
+            if shooter and shooter.id == 0 and shooter is not target:
+                self.engaged_at.setdefault(target.id, self.t)
+                if target.hp <= 0:
+                    self.player_kills.append({"time": round(self.t, 2), "tier": target.role,
+                                              "ttk": round(self.t - self.engaged_at[target.id], 2)})
             if shooter and shooter is not target:
                 shooter.mech_damage_dealt += min(before_hp, amount)
                 shooter.last_mech_hit = self.t
@@ -806,7 +813,7 @@ class Simulation:
                          decision_frames=len(actions))
         stats.update(death_audit=self.death_audit, medium_gun_shots=self.medium_gun_shots,
                      medium_gun_hits=self.medium_gun_hits,
-                     plugin_calls=m.controller.plugin_calls)
+                     plugin_calls=m.controller.plugin_calls, kill_timing=self.player_kills)
         result = {label: stats}
         return result
 
@@ -849,7 +856,7 @@ def main():
     hello["map"]["dir"] = str(args.arena.resolve())
     win, kills, points, death, probe = Counter(), {}, {}, {}, {}
     seeds = args.seed or PRACTICE_SEEDS
-    variants = args.variant or ("laser-cover",)
+    variants = args.variant or ("clear-waves",)
     jobs = [(variant, seed) for variant in variants for seed in seeds]
     pool = ProcessPoolExecutor(max_workers=args.jobs) if args.jobs > 1 else None
     try:

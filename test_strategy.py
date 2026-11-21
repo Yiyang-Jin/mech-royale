@@ -34,19 +34,31 @@ class StrategyTests(unittest.TestCase):
         self.assertAlmostEqual(intercept((100, 0, 0), (10, 0, 0), 100, 4), 96 / 90)
         self.assertIsNone(intercept((100, 0, 0), (110, 0, 0), 100))
 
-    def test_wave_probe_spares_only_the_opening_pursuer(self):
+    def test_gun_velocity_filters_two_lateral_reversals(self):
         bot = Bot(self.hello)
-        bot.wave_probe = True
-        me = {"pos": (0, 0, 0), "weapons": [{"kind": "gun"}, {"kind": "laser"}], "cubes": 7}
-        enemy = {"id": 8, "pos": (46, 0, 0), "hp": 349}
-        self.assertIs(bot.spare_pursuer(me, [enemy], 89.9), enemy)
-        self.assertIsNone(bot.spare_pursuer(me, [enemy], 90))
-        self.assertIsNone(bot.spare_pursuer(me, [enemy, enemy], 50))
-        self.assertIsNone(bot.spare_pursuer(me, [dict(enemy, hp=350)], 50))
-        self.assertIsNone(bot.spare_pursuer(me, [dict(enemy, pos=(45, 0, 0))], 50))
-        self.assertIsNone(bot.spare_pursuer(dict(me, cubes=8), [enemy], 50))
-        bot.update_situation({"t": 10, "events": [{"type": "kill", "target": 9}]})
-        self.assertIsNone(bot.spare_pursuer(me, [enemy], 50))
+        target = {"id": 8, "pos": (100, 0, 0)}
+        for index, vy in enumerate((10, 10, -10, -10, 10, 10, 10)):
+            bot.track_targets(index / 10, [dict(target, vel=(0, vy, 0))])
+        self.assertEqual(bot.gun_velocity((0, 0, 0), target, (0, 10, 0)), (0, 3.5, 0))
+        bot.track_targets(.9, [dict(target, vel=(0, 10, 0))])
+        self.assertEqual(bot.gun_velocity((0, 0, 0), target, (0, 10, 0)), (0, 10, 0))
+
+    def test_full_laser_redirects_only_from_a_blocked_primary(self):
+        bot = Bot(self.hello)
+        me = deepcopy(self.replay[0]["self"])
+        stats = self.hello["config"]["weapons"]["laser"]
+        me["weapons"][1] = {"kind": "laser", "stats": stats, "charge": stats["charge"], "cooldown": 0}
+        x, y, z = me["pos"]
+        primary = {"id": 8, "kind": "mech", "pos": (x+60, y, z)}
+        alternate = {"id": 9, "kind": "mech", "pos": (x, y+55, z)}
+        with (patch.object(bot.arena, "solid_between", return_value=True) as wall,
+              patch.object(bot, "aim", return_value=(math.pi/2, 0, .04, .04))):
+            self.assertIs(bot.redirect_full_laser(me, primary, [primary, alternate]), alternate)
+            wall.return_value = False
+            self.assertIs(bot.redirect_full_laser(me, primary, [primary, alternate]), primary)
+            wall.return_value = True
+            me["weapons"][1]["charge"] *= .5
+            self.assertIs(bot.redirect_full_laser(me, primary, [primary, alternate]), primary)
 
     def test_early_bullet_cpa_and_mortar_landing_priority(self):
         bot = Bot(self.hello)

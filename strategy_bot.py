@@ -1,4 +1,5 @@
 """Mech Royale strategy for the mechfight/1 game protocol."""
+from collections import deque
 from dataclasses import dataclass
 import math
 from time import perf_counter
@@ -84,11 +85,14 @@ class Bot:
         self.config = hello["config"]
         self.arena = Arena(hello["map"]["dir"])
         self.practice = practice
-        self.wave_probe = False
+        self.clear_waves = False
+        self.aim_history = {}
+        self.opening_pickup_id = None
+        self.opening_pickup_until = -math.inf
+        self.attempted_pickups = set()
         match = self.config["match"]
         self.physics_step = 1 / match["tick_hz"]
         self.turn_step = match["decide_every"] * self.physics_step
-        self.kills = set()
         self.last_combat = -math.inf
         self.last_damage_bearing = None
         self.last_damage = -math.inf
@@ -123,22 +127,87 @@ class Bot:
             if kind in ("damaged", "hit"):
                 self.last_combat = now
             if kind == "kill":
-                self.kills.add(event["target"])
                 self.last_combat = now
                 self.collect_until = now + 3
             if kind == "damaged" and event["bearing"] is not None:
                 self.last_damage_bearing = event["bearing"]
                 self.last_damage = now
 
-    def spare_pursuer(self, me, enemies, now):
-        if not self.wave_probe or self.kills or now >= 90 or len(enemies) != 1:
-            return None
-        has_laser = any(weapon and weapon["kind"] == "laser" for weapon in me["weapons"])
-        if has_laser and me["cubes"] >= 8:
-            return None
-        enemy, = enemies
-        if enemy.get("hp", math.inf) < 350 and distance(me["pos"], enemy["pos"]) > 45:
-            return enemy
+    def track_targets(self, now, enemies):
+        for enemy in enemies:
+            if "vel" not in enemy:
+                continue
+            history = self.aim_history.setdefault(enemy["id"], deque())
+            if history and now - history[-1][0] > .25:
+                history.clear()
+            history.append((now, enemy["pos"], enemy["vel"]))
+        for ident, history in list(self.aim_history.items()):
+            while history and now - history[0][0] > .8:
+                history.popleft()
+            if not history:
+                del self.aim_history[ident]
+
+    def gun_velocity(self, pos, target, current):
+        history = self.aim_history.get(target.get("id"))
+        if not history or len(history) < 5:
+            return current
+        dx, dy = target["pos"][0] - pos[0], target["pos"][1] - pos[1]
+        gap = math.hypot(dx, dy)
+        if gap < 1:
+            return current
+        lateral = [(dx * vel[1] - dy * vel[0]) / gap for _, _, vel in history]
+        signs = [value > 0 for value in lateral if abs(value) > .85]
+        if sum(a != b for a, b in zip(signs, signs[1:])) < 2:
+            return current
+        now, latest, _ = history[-1]
+        at, earlier, _ = min(list(history)[:-1], key=lambda item: abs(now - item[0] - .6))
+        span = now - at
+        if span < .5:
+            return current
+        return tuple(.35 * speed + .65 * (a - b) / span for speed, a, b in zip(current, latest, earlier))
+
+    def redirect_full_laser(self, me, target, enemies):
+        laser = next((w for w in me["weapons"] if w and w["kind"] == "laser"), None)
+        if target is None or self.laser_unsafe or laser is None:
+            return target
+        if laser.get("charge", 0) + 1e-6 < laser["stats"]["charge"]:
+            return target
+        pos = me["pos"]
+        muzzle = (*pos[:2], pos[2] + me["stats"]["muzzle_height"])
+        if target.get("kind") != "mech":
+            return target
+        chest = self.mech_point(target, self.config["mech"]["height"] / 2)
+        if not self.arena.solid_between(muzzle, chest):
+            return target
+        yaw, pitch = me["aim"]
+        choices = []
+        for enemy in enemies:
+            if enemy["id"] == target["id"]:
+                continue
+            solution = self.aim(me, enemy, laser)
+            if solution is not None:
+                turn = max(abs(angle_error(solution[0], yaw)) / me["stats"]["turn_rate"],
+                           abs(solution[1] - pitch) / me["stats"]["pitch_rate"])
+                choices.append((turn, enemy))
+        return min(choices, key=lambda entry: entry[0])[1] if choices else target
+
+    def opening_weapon(self, obs, loot, near_dist):
+        now = obs["t"]
+        me, zone = obs["self"], obs["zone"]
+        order = self.weapon_order(zone["radius"])
+        for item in loot:
+            if (distance(me["pos"], item["pos"]) > 45
+                    or distance(item["pos"], self.safe_destination(obs, item["pos"][:2])) > 1
+                    or (None not in me["weapons"] and self.replacement_slot(
+                        me["weapons"], item["kind"], order, zone["radius"], near_dist) is None)):
+                continue
+            ident = item["id"]
+            if ident == self.opening_pickup_id and now < self.opening_pickup_until:
+                return item
+            if ident not in self.attempted_pickups:
+                self.attempted_pickups.add(ident)
+                self.opening_pickup_id, self.opening_pickup_until = ident, now + 3
+                return item
         return None
 
     def aim(self, me, target, weapon, check_path=True):
@@ -160,6 +229,8 @@ class Bot:
         offset = target_pos[0] - x, target_pos[1] - y, target_pos[2] + aim_height - muzzle
         velocity = target.get("vel", (0, 0, 0))
         if kind == "gun":
+            if self.clear_waves and target_kind == "mech":
+                velocity = self.gun_velocity(me["pos"], target, velocity)
             flight = intercept(offset, velocity, stats["speed"], me["stats"]["radius"] + 0.5)
             if flight is None:
                 return None
@@ -439,7 +510,7 @@ class Bot:
         phase = (now + self.weave_offset) % 1.05
         return self.turn_side if phase < 0.45 else -self.turn_side
 
-    def kite_goal(self, me, target, tactics, now=0, zone_radius=math.inf, execute=False):
+    def kite_goal(self, me, target, tactics, now=0, zone_radius=math.inf, execute=False, ideal_override=None):
         pos = me["pos"]
         gap = distance(pos, target["pos"])
         facing = bearing(pos, target["pos"])
@@ -466,6 +537,8 @@ class Bot:
             ideal *= 1.4
         if execute:
             ideal = 45
+        if ideal_override is not None:
+            ideal = ideal_override
         # Blend strafe and range correction smoothly across the preferred band.
         correction = max(-1, min(1, (gap - ideal) / tactics.kite_band))
         side = self.weave_side(now) if 24 < gap < 155 else self.turn_side
@@ -1001,6 +1074,8 @@ class Bot:
         enemies = sorted((a for a in obs["mechs"] if a["kind"] == "mech"),
                          key=lambda a: distance(pos, a["pos"]))
         self.update_situation(obs)
+        if self.clear_waves:
+            self.track_targets(now, enemies)
         hp = me["hp"] / me["max_hp"]
         tactics = self.practice
         if hp < tactics.retreat_hp:
@@ -1019,8 +1094,7 @@ class Bot:
         active_enemies = [e for e in enemies if distance(pos, e["pos"]) < 115]
         outnumbered = len(active_enemies) >= 3 and near_dist > 22
         disengage = self.recovering or outnumbered
-        spared = self.spare_pursuer(me, enemies, now)
-        target = None if spared is not None else self.select_target(me, enemies)
+        target = self.select_target(me, enemies)
         recover_covered = (self.recovering and me["grounded"] and not recently_hit
                            and self.covered_for_recovery(me, enemies, tactics))
         if recover_covered:
@@ -1034,17 +1108,25 @@ class Bot:
         if fight_close and (target is None or distance(pos, target["pos"]) > 45):
             target = self.select_target(me, [e for e in enemies if distance(pos, e["pos"]) <= 45])
         execute = (not self.recovering or recovery_stalled) and self.can_execute(me, target, enemies)
+        finish_range = None
+        if (self.clear_waves and not disengage and hp > .65 and len(active_enemies) == 1
+                and target is active_enemies[0] and target.get("hp", math.inf) < 750):
+            lightning = any(w and w["kind"] == "lightning" and me["energy"] >= w["stats"]["energy"]
+                            for w in me["weapons"])
+            finish_range = 42 if lightning and "lightning" not in target.get("weapons", ()) else 52
+            execute = True
         quick_finish = (execute and target.get("hp", math.inf) < 350
                         and distance(pos, target["pos"]) < 70 and self.arena.clear_shot(
                             (*pos[:2], pos[2] + me["stats"]["muzzle_height"]),
                             self.mech_point(target, self.config["mech"]["height"] / 2)))
 
         action: mf.Action = {"tick": obs["tick"]}
-        opening = not disengage and (spared is not None or (
-            now < 70 and (None in me["weapons"] or me["cubes"] < 5) and near_dist > 55))
+        opening = (not disengage and now < 70
+                   and (None in me["weapons"] or me["cubes"] < 5) and near_dist > 55)
+        opening_duel = self.clear_waves and now < 70 and hp > .55 and len(enemies) == 1 and not disengage
         if obs["offer"]:
             action["pick"] = self.choose_upgrade(me, obs["offer"])
-        loot = self.loot(obs, enemies, action, opening)
+        loot = self.loot(obs, enemies, action, opening or opening_duel)
         if "drop" in action and "take" not in action:
             me = dict(me, weapons=list(me["weapons"]))
             me["weapons"][action["drop"]] = None
@@ -1054,6 +1136,7 @@ class Bot:
             2, zone["shrink_end"] - now - 7
         )
 
+        opening_pickup = self.opening_weapon(obs, loot, near_dist) if opening_duel and not urgent_zone else None
         goal = zone_goal
         developing = False
         peek_plan = None
@@ -1092,8 +1175,15 @@ class Bot:
             elif recovery_route is not None:
                 goal = recovery_route
                 execute = False
-            elif quick_finish:
-                goal = self.kite_goal(me, target, tactics, now, zone["radius"], execute=True)
+            elif opening_pickup is not None:
+                developing, execute = True, False
+                goal = opening_pickup["pos"][:2]
+            elif quick_finish or finish_range is not None:
+                goal = self.kite_goal(me, target, tactics, now, zone["radius"], execute=True,
+                                      ideal_override=finish_range)
+            elif opening_duel and not kill_cubes:
+                goal = self.kite_goal(me, target, tactics, now, zone["radius"], execute=execute,
+                                      ideal_override=45 if execute else 72)
             elif supply is not None:
                 execute = False
                 _, contest, goal = supply
@@ -1146,7 +1236,7 @@ class Bot:
                     if target is not None and distance(pos, target["pos"]) > 28:
                         goal = target["pos"][:2]
         if (not urgent_zone and not disengage and supply is None and not execute
-                and peek_plan is None and corner is None):
+                and peek_plan is None and corner is None and not opening_duel):
             single_gun = len([w for w in me["weapons"] if w and w["kind"] == "gun"]) == 1 and None in me["weapons"]
             laser = None
             if single_gun and near_dist >= 80:
@@ -1191,7 +1281,7 @@ class Bot:
         self.move(me, goal, action, dodge, urgent_zone or (escaping and near_dist < 95),
                   False, cover_from if escaping else None)
         boost_route = ((developing and distance(pos, goal) > 9)
-                       or (execute and not urgent_zone and distance(pos, target["pos"]) > 50)
+                       or (execute and not urgent_zone and distance(pos, target["pos"]) > (finish_range + 4 if finish_range else 50))
                        or (supply is not None and supply[1] is None and distance(pos, goal) > 24))
         if (boost_route and dodge is None and me["grounded"]
                 and math.hypot(*action.get("move", (0, 0))) > 0.25):
@@ -1211,8 +1301,8 @@ class Bot:
             look = threat_bearing
         action["aim"] = list(peek_plan[1]) if peek_plan else [look, 0.0]
 
-        if spared is not None and target is not None and target["id"] == spared["id"]:
-            target = None
+        if self.clear_waves and not escaping and not urgent_zone:
+            target = self.redirect_full_laser(me, target, enemies)
         self.attack(me, target, action)
         if (escaping or urgent_zone) and threat_bearing is not None:
             shooter = next((e for e in enemies if e.get("charging") and distance(pos, e["pos"]) <= 200), None)
@@ -1226,13 +1316,6 @@ class Bot:
         gun = next((w for w in me["weapons"] if w and w["kind"] == "gun"), None)
         if gun and not gun["reload"] and gun["ammo"] < gun["stats"]["mag"]:
             action["reload"] = gun["ammo"] == 0 or (target is None and (near_dist > 65 or disengage))
-        if spared is not None:
-            for slot, weapon in enumerate(me["weapons"]):
-                if (weapon and weapon["kind"] == "laser" and weapon.get("charge", 0) > 0
-                        and self.laser_ray_hits(me, spared, weapon)):
-                    action["aim"] = [bearing(pos, spared["pos"]) + math.pi / 2, 0.0]
-                    action["fire"] = [index == slot for index in range(2)]
-                    break
         recovering = self.recovering and now - self.last_combat >= me["stats"]["regen_delay"]
         state = "healing" if recovering else "retreat" if escaping else "active"
         mf.draw.label(f"practice | {state}")
