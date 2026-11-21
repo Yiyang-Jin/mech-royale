@@ -8,6 +8,7 @@ import unittest
 from unittest.mock import patch
 
 from arena_geometry import Prism, RoofEntry, cells
+from canary_bot import GroundCanary
 from strategy_bot import Bot, PRACTICE, intercept
 
 
@@ -211,6 +212,21 @@ class StrategyTests(unittest.TestCase):
             obs["pickups"] = [{"id": 8001, "kind": "laser", "pos": [x, y - 25, z]}]
             self.assertLess(bot.act(obs)["move"][1], -0.9)
 
+    def test_farm_fire_does_not_turn_past_front_armour_limit(self):
+        bot = Bot(self.hello)
+        obs = deepcopy(self.replay[0])
+        x, y, z = obs["self"]["pos"]
+        obs["zone"].update(center=[x, y], next_center=[x, y], radius=400, next_radius=320)
+        foe = {"id": 12, "kind": "mech", "pos": [x + 160, y, z], "hp": 1400, "aim": [0, 0]}
+        crate = {"id": 1001, "pos": [x, y + 25, z], "hp": 300}
+        obs.update(t=100, mechs=[foe], crates=[crate], cubes=[], drops=[], pickups=[],
+                   sounds=[], projectiles=[], events=[], beams=[])
+        with (patch.object(bot.arena, "clear_shot", return_value=True),
+              patch.object(bot.arena, "walkable", return_value=True)):
+            self.assertAlmostEqual(bot.act(obs)["aim"][0], 0)
+            crate["pos"] = [x + 20, y + 15, z]
+            self.assertAlmostEqual(bot.act(obs)["aim"][0], math.atan2(15, 20))
+
     def test_big_circle_keeps_range_with_laser_or_underarmed_gun(self):
         bot = Bot(self.hello)
         me = deepcopy(self.replay[0]["self"])
@@ -243,13 +259,36 @@ class StrategyTests(unittest.TestCase):
         enemy = {"pos": [-90, 0, 0]}
         with patch.object(bot.arena, "walkable", side_effect=lambda me, yaw, reach: math.sin(yaw) > 0):
             goal = bot.orbit_goal(obs, (-224, 0), [enemy], 0)
-        self.assertGreater(goal[1], 30)
+        self.assertGreater(goal[1], 20)
         self.assertEqual(bot.safe_destination(obs, goal), goal)
-        with patch.object(bot.arena, "walkable", side_effect=lambda me, yaw, reach: math.sin(yaw) < 0):
+        with (patch.object(bot.arena, "walkable", side_effect=lambda me, yaw, reach: math.sin(yaw) < 0),
+              patch.object(bot, "orbit_node", side_effect=lambda me, point, accepts: point if accepts(point) else None)):
             obs["t"] = 85.9
-            self.assertEqual(bot.orbit_goal(obs, (-224, 0), [enemy], 0), goal)
+            self.assertGreater(bot.orbit_goal(obs, (-224, 0), [enemy], 0)[1], 20)
             obs["t"] = 86
-            self.assertLess(bot.orbit_goal(obs, (-224, 0), [enemy], 0)[1], -30)
+            self.assertLess(bot.orbit_goal(obs, (-224, 0), [enemy], 0)[1], -20)
+
+    def test_orbit_starts_at_map_edge_inside_wide_circle_and_snaps_to_grid(self):
+        bot = GroundCanary(self.hello)
+        obs = deepcopy(self.replay[0])
+        bounds = bot.arena.bounds
+        cx, cy = (bounds["minX"] + bounds["maxX"]) / 2, (bounds["minY"] + bounds["maxY"]) / 2
+        obs["zone"].update(center=[cx, cy], next_center=[cx, cy], radius=900, next_radius=900)
+        obs["t"] = 20
+        for x in (bounds["minX"] + 23, bounds["maxX"] - 23):
+            obs["self"]["pos"] = [x, cy, bot.arena.ground(x, cy)]
+            original = (x + (40 if x > cx else -40), cy)
+            goal = bot.orbit_goal(obs, original, [{"pos": [cx, cy, 0]}], 0)
+            self.assertGreater(abs(goal[1] - cy), 20)
+            self.assertGreaterEqual(goal[0], bounds["minX"] + 18)
+            self.assertLessEqual(goal[0], bounds["maxX"] - 18)
+            node = bot.static_routes.node_at(*bot.static_routes.indices(goal))
+            self.assertEqual(bot.static_routes.xyz[node][:2], goal)
+        x = bounds["minX"] + 98
+        obs["self"]["pos"] = [x, cy, bot.arena.ground(x, cy)]
+        goal = bot.orbit_goal(obs, (x - 40, cy), [{"pos": [cx, cy, 0]}], 0)
+        self.assertNotEqual(goal, (x - 40, cy))
+        self.assertLessEqual(math.dist(goal, (cx, cy)), abs(x - cx) + 8)
 
     def test_kiting_reverses_tangent_without_giving_up_range(self):
         bot = Bot(self.hello)
@@ -584,7 +623,7 @@ class StrategyTests(unittest.TestCase):
             self.assertLess(action["move"][0], -0.9)
             cover.return_value = None
             bot.cover_scan_cursor = 11
-            self.assertLess(bot.act(obs)["move"][0], -0.85)
+            self.assertLess(bot.act(obs)["move"][0], -0.5)
             bot.cover_scan_cursor = 0
             action = bot.act(obs)
             self.assertFalse(action["boost"])

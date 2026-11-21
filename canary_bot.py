@@ -10,6 +10,16 @@ class GroundCanary(Bot):
         super().__init__(hello)
         self.static_routes = StaticRoutes(self.arena, hello["config"]["mech"])
 
+    def orbit_node(self, me, point, accepts):
+        routes = self.static_routes
+
+        def connected(candidate):
+            node = routes.node_at(*routes.indices(candidate))
+            return bool(routes.edges[node]) and math.dist(candidate[:2], point) <= 6 and accepts(candidate)
+
+        node = routes.closest(point, connected)
+        return routes.xyz[node][:2] if node is not None else None
+
     def move(self, me, goal, action, dodge, hurry, quiet, cover_from=None):
         pos = me["pos"]
         if (dodge is None and self.roof is None and me["grounded"]
