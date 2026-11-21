@@ -650,6 +650,37 @@ class Bot:
             candidates.append((gap + item.get("hp", 300) * 0.08, item))
         return min(candidates, key=lambda option: option[0])[1] if candidates else None
 
+    def farm_route_safe(self, pos, goal, enemies):
+        dx, dy = goal[0] - pos[0], goal[1] - pos[1]
+        length_squared = dx * dx + dy * dy
+        for enemy in enemies:
+            ex, ey = enemy["pos"][0] - pos[0], enemy["pos"][1] - pos[1]
+            fraction = max(0, min(1, (ex * dx + ey * dy) / length_squared)) if length_squared else 0
+            if math.hypot(ex - fraction * dx, ey - fraction * dy) < 80:
+                return False
+        return True
+
+    def midgame_farm(self, obs, enemies, goal):
+        me = obs["self"]
+        pos = me["pos"]
+        heading = bearing(pos, goal) if distance(pos, goal) >= 2 else None
+        candidates = [
+            item for item in (*obs["crates"], *(a for a in obs["mechs"] if a["kind"] == "npc"))
+            if distance(pos, item["pos"]) <= 38 and abs(item["pos"][2] - pos[2]) <= 6
+        ]
+        candidates.sort(key=lambda item: distance(pos, item["pos"]) + 0.03 * item.get("hp", 300)
+                        - (8 if item.get("kind") == "npc" else 0))
+        farm = next((item for item in candidates
+                     if any(self.aim(me, item, w) is not None for w in me["weapons"] if w)), None)
+        cubes = [
+            cube["pos"] for cube in obs["cubes"]
+            if distance(pos, cube["pos"]) <= 38 and abs(cube["pos"][2] - pos[2]) <= 4
+            and (heading is None or abs(angle_error(bearing(pos, cube["pos"]), heading)) <= math.pi / 4)
+            and distance(cube["pos"], self.safe_destination(obs, cube["pos"][:2])) <= 1
+            and self.farm_route_safe(pos, cube["pos"], enemies)
+        ]
+        return farm, min(cubes, key=lambda point: distance(pos, point), default=None)
+
     def can_execute(self, me, target, enemies):
         if target is None or me["hp"] <= 600:
             return False
@@ -1065,6 +1096,28 @@ class Bot:
                         goal = target["pos"][:2]
                 elif self.pvp and near_dist > 70:
                     quiet = True
+        if (not urgent_zone and not disengage and supply is None and not execute
+                and peek_plan is None and corner is None):
+            single_gun = len([w for w in me["weapons"] if w and w["kind"] == "gun"]) == 1 and None in me["weapons"]
+            laser = None
+            if single_gun and near_dist >= 80:
+                laser = min((p for p in loot if p["kind"] == "laser" and distance(pos, p["pos"]) <= 30
+                             and distance(p["pos"], self.safe_destination(obs, p["pos"][:2])) <= 1
+                             and self.farm_route_safe(pos, p["pos"], enemies)),
+                            key=lambda p: distance(pos, p["pos"]), default=None)
+            if laser is not None:
+                goal = laser["pos"][:2]
+                if distance(pos, goal) <= self.config["loot"]["pickup_radius"]:
+                    action["take"] = laser["id"]
+                else:
+                    action.pop("take", None)
+            elif (me["cubes"] < self.config["cubes"]["stat_cap"] and hp > 0.65 and near_dist > 95
+                  and not recently_hit and self.farm_route_safe(pos, self.safe_destination(obs, goal), enemies)):
+                farm, cube = self.midgame_farm(obs, enemies, goal)
+                if farm is not None:
+                    target = farm
+                if cube is not None:
+                    goal = cube[:2]
         if distance(pos, goal) < 2 and target is None and not disengage and not self.pvp and supply is None:
             goal = self.scout_goal(obs)
         if peek_plan is None:

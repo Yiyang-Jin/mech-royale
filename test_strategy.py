@@ -165,6 +165,28 @@ class StrategyTests(unittest.TestCase):
             bot.act(obs)
             self.assertEqual(attack.call_args.args[1], enemy)
 
+    def test_midgame_farms_with_far_enemy_and_prioritizes_nearby_laser(self):
+        bot = Bot(self.hello)
+        obs = deepcopy(self.replay[0])
+        me = obs["self"]
+        x, y, z = me["pos"]
+        obs["zone"].update(center=[x, y], next_center=[x, y], radius=400, next_radius=320)
+        foe = {"id": 12, "kind": "mech", "pos": [x + 160, y, z], "hp": 1400, "aim": [0, 0]}
+        crate = {"id": 1001, "pos": [x + 20, y + 3, z], "hp": 300}
+        obs.update(t=100, mechs=[foe], crates=[crate], cubes=[], drops=[], pickups=[],
+                   sounds=[], projectiles=[], events=[], beams=[])
+        with (patch.object(bot.arena, "clear_shot", return_value=True),
+              patch.object(bot.arena, "walkable", return_value=True),
+              patch.object(bot, "attack") as attack):
+            bot.act(obs)
+            self.assertIs(attack.call_args.args[1], crate)
+            me["cubes"] = 10
+            bot.act(obs)
+            self.assertIs(attack.call_args.args[1], foe)
+            foe["pos"][0] = x + 85
+            obs["pickups"] = [{"id": 8001, "kind": "laser", "pos": [x, y - 25, z]}]
+            self.assertLess(bot.act(obs)["move"][1], -0.9)
+
     def test_big_circle_keeps_range_with_laser_or_underarmed_gun(self):
         bot = Bot(self.hello)
         me = deepcopy(self.replay[0]["self"])
