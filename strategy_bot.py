@@ -18,6 +18,21 @@ class Tactics:
     cover_hold_distance: float = 50
 
 
+@dataclass(frozen=True)
+class Shot:
+    slot: int
+    yaw: float
+    pitch: float
+    yaw_margin: float
+    pitch_margin: float
+    priority: int
+    trigger: bool
+
+    def aligned(self, yaw, pitch):
+        return (abs(angle_error(self.yaw, yaw)) <= self.yaw_margin
+                and abs(self.pitch - pitch) <= self.pitch_margin)
+
+
 PRACTICE = Tactics(0.56, 0.88, 72, 115, 82, 29)
 FREE_FOR_ALL = Tactics(0.66, 0.88, 88, 135, 98, 32)
 
@@ -124,7 +139,9 @@ class Bot:
         muzzle = z + (me["stats"]["height"] + 0.5 if kind == "mortar"
                       else me["stats"]["muzzle_height"])
         start = x, y, muzzle
-        offset = target_pos[0] - x, target_pos[1] - y, target_pos[2] + dimensions["height"] * size / 2 - muzzle
+        target_height = dimensions["height"] * size
+        aim_height = min(0.8, target_height / 2) if kind == "mortar" else target_height / 2
+        offset = target_pos[0] - x, target_pos[1] - y, target_pos[2] + aim_height - muzzle
         velocity = target.get("vel", (0, 0, 0))
         if kind == "gun":
             flight = intercept(offset, velocity, stats["speed"], me["stats"]["radius"] + 0.5)
@@ -166,8 +183,11 @@ class Bot:
             if not self.arena.clear_shot(previous, point):
                 return None
             previous = point
-        tolerance = min(0.22, math.atan2(dimensions["radius"] * size * 0.85, max(1, horizontal)))
-        return yaw, pitch, tolerance
+        yaw_margin = min(0.22, math.atan2(dimensions["radius"] * size * 0.85, max(1, horizontal)))
+        pitch_margin = min(0.22, math.atan2(target_height * 0.38, max(1, math.hypot(horizontal, dz))))
+        if kind == "mortar":
+            pitch_margin = min(pitch_margin, yaw_margin)
+        return yaw, pitch, yaw_margin, pitch_margin
 
     def attack(self, me, target, action):
         fire = [False, False]
@@ -179,33 +199,51 @@ class Bot:
         for slot, weapon in enumerate(me["weapons"]):
             if weapon is None:
                 continue
+            kind, stats = weapon["kind"], weapon["stats"]
+            if kind == "lightning" and me["energy"] < stats["energy"]:
+                continue
             solution = self.aim(me, target, weapon)
             if solution is None:
                 continue
-            desired_yaw, desired_pitch, tolerance = solution
-            kind, stats = weapon["kind"], weapon["stats"]
-            aligned = (abs(angle_error(desired_yaw, yaw)) <= tolerance
-                       and abs(desired_pitch - pitch) <= tolerance)
-            ready = weapon["cooldown"] <= self.turn_step and not weapon.get("reload", 0)
+            desired_yaw, desired_pitch, yaw_margin, pitch_margin = solution
+            if kind == "lightning":
+                yaw_margin = math.radians(stats["cone_deg"]) / 2
+                pitch_margin = math.inf
+            yaw_error = abs(angle_error(desired_yaw, yaw))
+            pitch_error = abs(desired_pitch - pitch)
+            aligned = yaw_error <= yaw_margin and pitch_error <= pitch_margin
+            ready = (weapon["cooldown"] <= self.turn_step and not weapon.get("reload", 0)
+                     and weapon.get("ammo", 1) > 0)
             if kind == "laser":
                 charging = weapon.get("charge", 0)
                 trigger = ready and (charging < stats["charge"] - self.physics_step / 2
                                      or (not aligned and charging < stats["charge"] + 0.2))
-                priority = 90 if charging else 44
+                priority = 100 if charging else 56
             elif kind == "lightning":
-                aligned = abs(angle_error(desired_yaw, yaw)) <= math.radians(stats["cone_deg"]) / 2
-                trigger = ready and aligned and me["energy"] >= stats["energy"]
-                priority = 60 if target.get("charging") else 48
+                trigger = ready and aligned
+                priority = 85 if target.get("charging") else 62
             else:
-                trigger = ready and aligned and weapon.get("ammo", 1) > 0
-                priority = 34 if kind == "mortar" else 40
-            if not ready or (kind != "laser" and not aligned):
-                priority -= 30
-            options.append((priority, slot, desired_yaw, desired_pitch, trigger))
+                trigger = ready and aligned
+                priority = 66 if kind == "mortar" else 50
+            close_to_alignment = (
+                yaw_error <= yaw_margin + me["stats"]["turn_rate"] * self.turn_step
+                and pitch_error <= pitch_margin + me["stats"]["pitch_rate"] * self.turn_step
+            )
+            if not ready or (kind != "laser" and not close_to_alignment):
+                priority -= 70
+            options.append(Shot(slot, desired_yaw, desired_pitch, yaw_margin,
+                                pitch_margin, priority, trigger))
         if options:
-            _, slot, desired_yaw, desired_pitch, trigger = max(options)
-            action["aim"] = [desired_yaw, desired_pitch]
-            fire[slot] = trigger
+            primary = max(options, key=lambda shot: shot.priority)
+            action["aim"] = [primary.yaw, primary.pitch]
+            for shot in options:
+                if shot.trigger and (
+                    shot is primary or (
+                        me["weapons"][shot.slot]["kind"] != "laser"
+                        and shot.aligned(primary.yaw, primary.pitch)
+                    )
+                ):
+                    fire[shot.slot] = True
 
     def projectile_threat(self, obs):
         me = obs["self"]

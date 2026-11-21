@@ -62,6 +62,43 @@ class StrategyTests(unittest.TestCase):
         me["weapons"][1] = {"kind": "lightning", "stats": stats, "cooldown": 0}
         self.assertGreater(bot.kite_goal(me, {"pos": [32, 0, 0]}, PRACTICE)[0], 0)
 
+    def test_fires_both_slots_when_their_aim_overlaps(self):
+        bot = Bot(self.hello)
+        me = deepcopy(self.replay[0]["self"])
+        stats = self.hello["config"]["weapons"]["lightning"]
+        me["weapons"][1] = {"kind": "lightning", "stats": stats, "cooldown": 0}
+        me["aim"] = [0, 0]
+        action = {}
+        with patch.object(bot, "aim", return_value=(0, 0, 0.04, 0.08)):
+            bot.attack(me, {}, action)
+            self.assertEqual(action["fire"], [True, True])
+            me["energy"] = stats["energy"] - 1
+            bot.attack(me, {}, action)
+            self.assertEqual(action["fire"], [True, False])
+
+    def test_ready_mortar_can_take_priority_over_gun(self):
+        bot = Bot(self.hello)
+        me = deepcopy(self.replay[0]["self"])
+        mortar = self.hello["config"]["weapons"]["mortar"]
+        me["weapons"][1] = {"kind": "mortar", "stats": mortar, "cooldown": 0}
+        me["aim"] = [0, 0.03]
+        action = {}
+        with patch.object(bot, "aim", side_effect=[(0, 0, 0.04, 0.04), (0, 0.06, 0.04, 0.04)]):
+            bot.attack(me, {}, action)
+        self.assertEqual(action["aim"], [0, 0.06])
+        self.assertEqual(action["fire"], [False, True])
+
+    def test_full_laser_releases_while_aligned_gun_can_fire(self):
+        bot = Bot(self.hello)
+        me = deepcopy(self.replay[0]["self"])
+        laser = self.hello["config"]["weapons"]["laser"]
+        me["weapons"][1] = {"kind": "laser", "stats": laser, "cooldown": 0, "charge": laser["charge"]}
+        me["aim"] = [0, 0]
+        action = {}
+        with patch.object(bot, "aim", return_value=(0, 0, 0.04, 0.08)):
+            bot.attack(me, {}, action)
+        self.assertEqual(action["fire"], [True, False])
+
     def test_recovery_holds_cover_but_still_respects_zone(self):
         bot = Bot(self.hello)
         obs = deepcopy(self.replay[0])
