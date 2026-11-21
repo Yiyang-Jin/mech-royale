@@ -3,7 +3,7 @@ from dataclasses import dataclass
 import math
 
 from arena_geometry import Arena
-from ground_navigation import GroundNavigation
+from ground_navigation import Navigation
 import mechfight as mf
 
 
@@ -15,8 +15,6 @@ class Tactics:
     laser_distance: float
     mortar_distance: float
     lightning_distance: float
-    kite_band: float = 14
-    cover_hold_distance: float = 50
 
 
 @dataclass(frozen=True)
@@ -73,7 +71,7 @@ class Bot:
     def __init__(self, hello: mf.Hello, practice=PRACTICE, free_for_all=FREE_FOR_ALL):
         self.config = hello["config"]
         self.arena = Arena(hello["map"]["dir"])
-        self.navigation = GroundNavigation(self.arena, self.config["mech"])
+        self.navigation = Navigation(self.arena, self.config)
         self.practice, self.free_for_all = practice, free_for_all
         match = self.config["match"]
         self.physics_step = 1 / match["tick_hz"]
@@ -88,11 +86,6 @@ class Bot:
         self.scout_until = -math.inf
         self.scout_turn = 0
         self.turn_side = 1 if hello["slot"] % 2 else -1
-        self.weave_offset = hello["slot"] * 0.083
-        self.roof = None
-        self.roof_phase = "approach"
-        self.roof_deadline = -math.inf
-        self.roof_retry = -math.inf
 
     def update_situation(self, obs):
         now = obs["t"]
@@ -224,38 +217,6 @@ class Bot:
                 ):
                     fire[shot.slot] = True
 
-    def projectile_threat(self, obs):
-        me = obs["self"]
-        x, y, z = me["pos"]
-        vx, vy, vz = me["vel"]
-        radius = me["stats"]["radius"]
-        best = None
-        for shot in obs["projectiles"]:
-            px, py, pz = shot["pos"]
-            sx, sy, sz = shot["vel"]
-            dx, dy = px - x, py - y
-            rx, ry = sx - vx, sy - vy
-            speed_squared = rx * rx + ry * ry
-            if speed_squared < 1:
-                continue
-            t = -(dx * rx + dy * ry) / speed_squared
-            if not 0 < t < 0.45:
-                continue
-            closest = dx + rx * t, dy + ry * t
-            shell = shot["kind"] == "mortar"
-            mortar = self.config["weapons"]["mortar"]
-            clearance = radius + (mortar["splash_radius"] if shell else 0.7)
-            height = pz - z + (sz - vz) * t - (mortar["gravity"] * t * t / 2 if shell else 0)
-            if math.hypot(*closest) > clearance or not -0.5 <= height <= me["stats"]["height"] + 0.5:
-                continue
-            side = 1 if ry * closest[0] - rx * closest[1] >= 0 else -1
-            dodge = math.atan2(rx * side, -ry * side)
-            if best is None or t < best[0]:
-                best = t, dodge
-        if best is not None:
-            return best[1]
-        return None
-
     def safe_destination(self, obs, goal, margin=16):
         zone = obs["zone"]
         current = zone["center"]
@@ -269,13 +230,8 @@ class Bot:
             return goal
         return tuple(c + (p - c) * extent / d for c, p in zip(center, goal))
 
-    def weave_side(self, now):
-        return self.turn_side * (-1 if int((now + self.weave_offset) / 0.78) % 2 else 1)
-
-    def kite_goal(self, me, target, tactics, now=0):
-        pos = me["pos"]
-        gap = distance(pos, target["pos"])
-        facing = bearing(pos, target["pos"])
+    def ideal_range(self, me, target, tactics):
+        gap = distance(me["pos"], target["pos"])
         preferred = []
         for weapon in me["weapons"]:
             if weapon is None:
@@ -294,137 +250,9 @@ class Bot:
         ideal = max(preferred, default=(0, tactics.gun_distance))[1]
         if not preferred:
             ideal *= 1.4
-        # Blend strafe and range correction smoothly across the preferred band.
-        correction = max(-1, min(1, (gap - ideal) / tactics.kite_band))
-        side = self.weave_side(now) if 24 < gap < 155 else self.turn_side
-        yaw = facing + side * (1 - correction) * math.pi / 2
-        return pos[0] + 32 * math.cos(yaw), pos[1] + 32 * math.sin(yaw)
-
-    def covered_for_recovery(self, me, enemies, tactics):
-        pos = me["pos"]
-        eye = (*pos[:2], pos[2] + me["stats"]["eye_height"])
-        muzzle = self.config["mech"]["muzzle_height"]
-        for enemy in enemies:
-            ex, ey, ez = enemy["pos"]
-            if (distance(pos, enemy["pos"]) < tactics.cover_hold_distance
-                    and pos[2] - ez < 8):
-                return False
-            scale = 1 + self.config["cubes"]["size_per_cube"] * enemy.get("cubes", 0)
-            if not self.arena.solid_between((ex, ey, ez + muzzle * scale), eye):
-                return False
-        return True
-
-    def move(self, me, goal, action, dodge, hurry, quiet, cover_from=None, close_threat=False):
-        d = distance(me["pos"], goal)
-        if dodge is None and d < 2:
-            return
-        yaw = dodge if dodge is not None else bearing(me["pos"], goal)
-        stats = me["stats"]
-        magnitude = min(1, d / (stats["walk_speed"] * self.turn_step + 1))
-        if dodge is not None:
-            magnitude = 1
-        if quiet:
-            magnitude = min(magnitude, 0.94 * self.config["sound"]["step_speed"] / stats["walk_speed"])
-        horizon = max(4, stats["walk_speed"] * magnitude * 0.38 + stats["radius"])
-        if dodge is None:
-            horizon = min(horizon, d)
-        offsets = (0, 30, -30, 63, -63, 100, -100, 150, -150)
-        best_yaw = None
-        for offset in offsets:
-            candidate = yaw + self.turn_side * math.radians(offset)
-            if self.arena.walkable(me, candidate, horizon):
-                if best_yaw is None:
-                    best_yaw = candidate
-                if cover_from is None or abs(offset) > 63:
-                    break
-                x, y, z = me["pos"]
-                after_move = (x + horizon * math.cos(candidate), y + horizon * math.sin(candidate),
-                              z + stats["eye_height"])
-                if self.arena.solid_between(cover_from, after_move):
-                    best_yaw = candidate
-                    break
-        if best_yaw is None:
-            # shortcut: a local escape jump can clear short ledges; add route planning for deep concavities.
-            action["jump"] = me["grounded"] and me["energy"] > 35
-            action["boost"] = not me["grounded"] and me["energy"] > 30
-            return
-        action["move"] = [math.cos(best_yaw) * magnitude, math.sin(best_yaw) * magnitude]
-        remaining = me["energy"] - stats["boost_drain"] * self.turn_step
-        reserve = 24 if close_threat else 65
-        action["boost"] = (hurry or dodge is not None) and me["grounded"] and remaining >= reserve
-
-    def roof_escape(self, obs, enemies, action, enabled, urgent_zone):
-        now, me = obs["t"], obs["self"]
-        pos = me["pos"]
-        if urgent_zone or now > self.roof_deadline:
-            self.roof = None
-        if urgent_zone:
-            return False
-        if self.roof is None:
-            if not enabled or not enemies or now < self.roof_retry or not me["grounded"] or me["energy"] < 42:
-                return False
-            self.roof_retry = now + 2
-            stats = me["stats"]
-            muzzle = self.config["mech"]["muzzle_height"]
-            candidates = []
-            for roof in self.arena.roof_entries(me):
-                if distance(roof.shelter, self.safe_destination(obs, roof.shelter)) > 2:
-                    continue
-                if any(distance(roof.launch, e["pos"]) < 19 for e in enemies):
-                    continue
-                eye = (*roof.shelter, roof.top + stats["eye_height"])
-                cover = [self.arena.solid_between((e["pos"][0], e["pos"][1], e["pos"][2] + muzzle), eye)
-                         for e in enemies]
-                if cover[0]:
-                    cost = distance(pos, roof.launch) + roof.energy * 0.22
-                    candidates.append((cost - sum(cover) * 18, roof))
-            if not candidates:
-                return False
-            self.roof = min(candidates, key=lambda item: item[0])[1]
-            self.roof_phase = "approach"
-            self.roof_deadline = now + 11
-        roof = self.roof
-        if self.roof_phase == "approach":
-            gap = distance(pos, roof.launch)
-            if gap > 0.55:
-                if gap > 7:
-                    self.move(me, roof.launch, action, None, False, False)
-                else:
-                    yaw = bearing(pos, roof.launch)
-                    speed = min(0.35, gap / 8)
-                    action["move"] = [math.cos(yaw) * speed, math.sin(yaw) * speed]
-                return True
-            if math.hypot(*me["vel"][:2]) > 1:
-                action["move"] = [0, 0]
-                return True
-            if not me["grounded"] or me["energy"] < roof.energy - 2:
-                self.roof = None
-                return False
-            self.roof_phase = "climb"
-        if self.roof_phase == "climb" and pos[2] <= roof.top + 0.5:
-            if me["energy"] < 8:
-                self.roof = None
-                return False
-            action.update(move=[0, 0], jump=me["grounded"], boost=not me["grounded"])
-            return True
-
-        self.roof_phase = "cross"
-        if distance(pos, roof.shelter) < 2.5 and me["grounded"]:
-            self.roof = None
-            self.roof_retry = now + 5
-            return False
-        if pos[2] < roof.top - 0.5 or (me["energy"] < 2 and pos[2] <= roof.top + 0.5):
-            self.roof = None
-            return False
-        dx, dy = roof.landing[0] - roof.launch[0], roof.landing[1] - roof.launch[1]
-        past_edge = dx * (pos[0] - roof.landing[0]) + dy * (pos[1] - roof.landing[1]) >= 0
-        if distance(pos, roof.shelter) < 2.5:
-            action["move"] = [0, 0]
-        else:
-            yaw = bearing(pos, roof.shelter)
-            action["move"] = [math.cos(yaw), math.sin(yaw)]
-        action["boost"] = not past_edge and not me["grounded"] and me["energy"] >= 2
-        return True
+        if "lightning" in target.get("weapons", ()):
+            ideal = max(55, ideal)
+        return ideal
 
     def loot(self, obs, enemies, action):
         me = obs["self"]
@@ -569,67 +397,46 @@ class Bot:
         )
 
         goal = zone_goal
-        quiet = False
-        recover_covered = (self.recovering and me["grounded"] and not recently_hit
-                           and self.covered_for_recovery(me, enemies, tactics))
+        movement = "travel"
         if not urgent_zone:
             resources = None
-            if not self.pvp and not disengage and not recently_hit and near_dist > 42:
+            if not disengage and not recently_hit and near_dist > 42:
                 resources = self.resource_goal(obs, loot, enemies)
             drops = [d for d in obs["drops"] if d["lands_in"] == 0 and d["holder"] in (None, me["id"])
-                     and hp < 0.78 and not enemies and not recently_hit
-                     and distance(pos, d["pos"]) < 42]
+                     and hp < 0.78 and not enemies and not recently_hit and distance(pos, d["pos"]) < 42]
             if drops:
                 goal = min(drops, key=lambda d: distance(pos, d["pos"]))["pos"][:2]
-            elif recover_covered:
-                goal = zone_goal
-            elif threat_bearing is not None and (disengage or (self.pvp and target is None and near_dist < 70)):
-                away = threat_bearing + math.pi + 0.33 * self.weave_side(now)
-                goal = (pos[0] + 40 * math.cos(away), pos[1] + 40 * math.sin(away))
+            elif disengage:
+                if enemies:
+                    movement = "retreat"
+                elif recently_hit and threat_bearing is not None:
+                    away = threat_bearing + math.pi
+                    goal = (pos[0] + 36 * math.cos(away), pos[1] + 36 * math.sin(away))
+                elif distance(pos, zone_goal) < 2:
+                    movement = "hold"
             elif resources is not None:
                 goal = resources
             elif target is not None:
-                goal = self.kite_goal(me, target, tactics, now)
-            elif not disengage:
-                cubes = [c for c in obs["cubes"] if abs(c["pos"][2] - pos[2]) < 4]
-                cap = self.config["cubes"]["stat_cap"] if not self.pvp else 6
-                if self.pvp and cubes and me["cubes"] < cap and not active_enemies:
-                    goal = min(cubes, key=lambda c: distance(pos, c["pos"]))["pos"][:2]
-                elif self.pvp and None in me["weapons"] and loot and not active_enemies:
-                    goal = min(loot, key=lambda p: distance(pos, p["pos"]))["pos"][:2]
-                elif not enemies and me["cubes"] < cap and not recently_hit:
-                    farm = [a for a in (*obs["crates"], *obs["mechs"])
-                            if a.get("kind") != "mech" and distance(pos, a["pos"]) < (60 if self.pvp else 120)]
-                    target = min(farm, key=lambda a: distance(pos, a["pos"]), default=None)
-                    if target is not None and distance(pos, target["pos"]) > 28:
-                        goal = target["pos"][:2]
-                elif self.pvp and near_dist > 70:
-                    quiet = True
-        if distance(pos, goal) < 2 and target is None and not disengage and not self.pvp:
+                movement = "kite"
+            elif not enemies and me["cubes"] < self.config["cubes"]["stat_cap"] and not recently_hit:
+                farm = [a for a in (*obs["crates"], *obs["mechs"])
+                        if a.get("kind") != "mech" and distance(pos, a["pos"]) < 120]
+                target = min(farm, key=lambda a: distance(pos, a["pos"]), default=None)
+                if target is not None:
+                    goal = target["pos"][:2] if distance(pos, target["pos"]) > 28 else pos[:2]
+        if movement == "travel" and not urgent_zone and distance(pos, goal) < 2 and target is None:
             goal = self.scout_goal(obs)
         goal = self.safe_destination(obs, goal)
-        # Dash back across the current circle boundary before pursuing the next circle.
         if not me["in_zone"] and distance(pos, goal) < 2:
             goal = zone["center"]
-        dodge = self.projectile_threat(obs)
-        if dodge is None and nearest and nearest.get("charging") and near_dist < 145:
-            aim_error = angle_error(bearing(nearest["pos"], pos), nearest["aim"][0])
-            if abs(aim_error) < 0.16:
-                dodge = threat_bearing + self.turn_side * math.pi / 2
-        cover_from = None
-        if nearest and disengage and not urgent_zone and dodge is None:
-            tx, ty, tz = nearest["pos"]
-            cover_from = (tx, ty, tz + self.config["mech"]["muzzle_height"])
-        roof_needed = (not self.pvp and not recover_covered and near_dist < 110
-                       and (self.recovering or len(active_enemies) >= 2))
-        climbing = self.roof_escape(obs, active_enemies, action, roof_needed, urgent_zone)
-        if climbing:
+        ideal = self.ideal_range(me, target, tactics) if movement == "kite" else None
+        controls, crossing = self.navigation.control(
+            obs, enemies, goal, movement, target if movement == "kite" else None,
+            ideal, recently_hit, urgent_zone,
+        )
+        action.update(controls)
+        if crossing:
             target = None
-        else:
-            if dodge is None:
-                goal = self.navigation.waypoint(me, goal, now)
-            self.move(me, goal, action, dodge, urgent_zone or (disengage and near_dist < 95),
-                      quiet and dodge is None and not urgent_zone, cover_from, near_dist < 20)
 
         if threat_bearing is None:
             self.scan = math.remainder(self.scan + 0.055, math.tau)
@@ -645,7 +452,7 @@ class Bot:
             action["reload"] = gun["ammo"] == 0 or (target is None and (near_dist > 65 or disengage))
         mode = "FFA" if self.pvp else "practice"
         recovering = self.recovering and now - self.last_combat >= me["stats"]["regen_delay"]
-        state = "roof" if climbing else "healing" if recovering else "retreat" if disengage else "active"
+        state = "roof transfer" if crossing else "healing" if recovering else movement
         mf.draw.label(f"{mode} | {state}")
         return action
 

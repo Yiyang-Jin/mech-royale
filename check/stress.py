@@ -69,8 +69,8 @@ def main():
         obs.update(t=10 + frame * 0.1, tick=200 + 2 * frame)
         # Revisit all decision paths independently of health hysteresis in earlier cases.
         bot.recovering = False
-        bot.roof = None
-        bot.roof_retry = -math.inf
+        bot.navigation.crossing = None
+        bot.navigation.plan_at = 0
         start = perf_counter()
         action = bot.act(obs)
         times.append((perf_counter() - start) * 1000)

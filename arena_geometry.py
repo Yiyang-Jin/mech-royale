@@ -1,7 +1,6 @@
 """Static arena geometry used by the bot."""
 from array import array
 from collections import defaultdict
-from dataclasses import dataclass
 from itertools import pairwise
 import json
 import math
@@ -10,15 +9,6 @@ import sys
 
 
 CELL = 32
-
-
-@dataclass(frozen=True)
-class RoofEntry:
-    launch: tuple[float, float]
-    landing: tuple[float, float]
-    shelter: tuple[float, float]
-    top: float
-    energy: float
 
 
 def contains(ring, x, y):
@@ -138,70 +128,6 @@ class Arena:
         dx, dy, dz = (b - a for a, b in zip(start, end))
         return all(z + dz * t > self.ground(x + dx * t, y + dy * t)
                    for t in (i / steps for i in range(1, steps + 1)))
-
-    def roof_entries(self, me, reach=38):
-        x, y, z = me["pos"]
-        stats = me["stats"]
-        radius = stats["radius"]
-        offset = radius + 3.25
-        launch_offset = max(3.2, radius + 0.7)
-        footprint = ((0, 0), (radius, 0), (-radius, 0), (0, radius), (0, -radius))
-        nearby = {p for cell in cells(x - reach, y - reach, x + reach, y + reach)
-                  for p in self.bins.get(cell, ())}
-        edges = []
-        for prism in nearby:
-            if prism.kind not in ("building", "bridge") or not 6 <= prism.top - z <= 22:
-                continue
-            for (ax, ay), (bx, by) in pairwise(prism.rings[0]):
-                dx, dy = bx - ax, by - ay
-                length = math.hypot(dx, dy)
-                if length < offset * 2:
-                    continue
-                along = ((x - ax) * dx + (y - ay) * dy) / length
-                along = max(offset, min(length - offset, along))
-                px, py = ax + dx * along / length, ay + dy * along / length
-                nx, ny = -dy / length, dx / length
-                if not prism.inside(px + nx, py + ny):
-                    nx, ny = -nx, -ny
-                launch = px - nx * launch_offset, py - ny * launch_offset
-                gap = math.dist((x, y), launch)
-                if gap <= reach and not prism.inside(*launch):
-                    edges.append((gap, launch, (px, py), (nx, ny), prism))
-
-        for gap, launch, edge, normal, prism in sorted(edges, key=lambda item: item[:2])[:16]:
-            lx, ly = launch
-            lz = self.ground(lx, ly)
-            rise = prism.top - lz
-            if not 6 <= rise <= 22 or (gap > 2 and not self.walkable(
-                me, math.atan2(ly - y, lx - x), gap
-            )):
-                continue
-            # Reserve jet time for crossing the lip after clearing it.
-            energy = stats["jet_drain"] * ((rise + 2) / stats["max_rise_speed"] + 1.65) + 8
-            if energy > me["energy"]:
-                continue
-            if any(self.solid_between((lx + ox, ly + oy, lz + 0.25),
-                                      (lx + ox, ly + oy, prism.top + stats["height"]))
-                   for ox, oy in footprint):
-                continue
-            nx, ny = normal
-            landing = edge[0] + nx * offset, edge[1] + ny * offset
-            shelter = None
-            for inset in (max(offset, 20), max(offset, 13), offset):
-                point = edge[0] + nx * inset, edge[1] + ny * inset
-                samples = max(1, math.ceil((inset - offset) / 3))
-                if all(prism.inside(
-                    landing[0] + nx * (inset - offset) * step / samples + ox,
-                    landing[1] + ny * (inset - offset) * step / samples + oy,
-                ) for step in range(samples + 1) for ox, oy in footprint):
-                    shelter = point
-                    break
-            if shelter is None:
-                continue
-            if any(self.solid_between((lx, ly, h), (*shelter, h))
-                   for h in (prism.top + 0.55, prism.top + stats["eye_height"])):
-                continue
-            yield RoofEntry(launch, landing, shelter, prism.top, energy)
 
     def walkable(self, me, yaw, distance):
         x, y, z = me["pos"]
