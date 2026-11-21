@@ -334,34 +334,71 @@ class Bot:
                 ):
                     fire[shot.slot] = True
 
+    def mortar_impact(self, shot, gravity):
+        x, y, z = shot["pos"]
+        vx, vy, vz = shot["vel"]
+
+        def height_above_ground(t):
+            return z + vz * t - gravity * t * t / 2 - self.arena.ground(x + vx * t, y + vy * t)
+
+        if height_above_ground(0) <= 0:
+            return None
+        for step in range(1, 21):
+            hi = step / 10
+            if height_above_ground(hi) > 0:
+                continue
+            lo = (step - 1) / 10
+            for _ in range(8):
+                mid = (lo + hi) / 2
+                if height_above_ground(mid) > 0:
+                    lo = mid
+                else:
+                    hi = mid
+            return hi, (x + vx * hi, y + vy * hi)
+        return None
+
     def projectile_threat(self, obs):
         me = obs["self"]
         x, y, z = me["pos"]
         vx, vy, vz = me["vel"]
         radius = me["stats"]["radius"]
         best = None
+        landing = None
+        mortar = self.config["weapons"]["mortar"]
         for shot in obs["projectiles"]:
             px, py, pz = shot["pos"]
             sx, sy, sz = shot["vel"]
             dx, dy = px - x, py - y
+            shell = shot["kind"] == "mortar"
+            if shell:
+                speed = sx * sx + sy * sy
+                closest_t = max(0, min(2, -(dx * sx + dy * sy) / speed)) if speed else 0
+                if math.hypot(dx + sx * closest_t, dy + sy * closest_t) <= 9.5:
+                    impact = self.mortar_impact(shot, mortar["gravity"])
+                    if impact is not None and distance((x, y), impact[1]) <= 9.5:
+                        if landing is None or impact[0] < landing[0]:
+                            escape = bearing(impact[1], (x, y)) if distance((x, y), impact[1]) > 0.2 else (
+                                math.atan2(sy, sx) + self.turn_side * math.pi / 2
+                            )
+                            landing = impact[0], escape
             rx, ry = sx - vx, sy - vy
             speed_squared = rx * rx + ry * ry
             if speed_squared < 1:
                 continue
             t = -(dx * rx + dy * ry) / speed_squared
-            if not 0 < t < 0.45:
+            if not 0 < t < (0.45 if shell else 0.85):
                 continue
             closest = dx + rx * t, dy + ry * t
-            shell = shot["kind"] == "mortar"
-            mortar = self.config["weapons"]["mortar"]
-            clearance = radius + (mortar["splash_radius"] if shell else 0.7)
+            clearance = radius + (mortar["splash_radius"] if shell else 1.2)
             height = pz - z + (sz - vz) * t - (mortar["gravity"] * t * t / 2 if shell else 0)
-            if math.hypot(*closest) > clearance or not -0.5 <= height <= me["stats"]["height"] + 0.5:
+            if math.hypot(*closest) >= clearance or not -0.5 <= height <= me["stats"]["height"] + 0.5:
                 continue
             side = 1 if ry * closest[0] - rx * closest[1] >= 0 else -1
             dodge = math.atan2(rx * side, -ry * side)
             if best is None or t < best[0]:
                 best = t, dodge
+        if landing is not None:
+            return landing[1]
         if best is not None:
             return best[1]
         return None
@@ -380,7 +417,8 @@ class Bot:
         return tuple(c + (p - c) * extent / d for c, p in zip(center, goal))
 
     def weave_side(self, now):
-        return self.turn_side * (-1 if int((now + self.weave_offset) / 0.78) % 2 else 1)
+        phase = (now + self.weave_offset) % 1.05
+        return self.turn_side if phase < 0.45 else -self.turn_side
 
     def kite_goal(self, me, target, tactics, now=0, zone_radius=math.inf, execute=False):
         pos = me["pos"]

@@ -44,6 +44,30 @@ class StrategyTests(unittest.TestCase):
         bot.update_situation(obs, [])
         self.assertTrue(bot.pvp)
 
+    def test_early_bullet_cpa_and_mortar_landing_priority(self):
+        bot = Bot(self.hello)
+        obs = deepcopy(self.replay[0])
+        me = obs["self"]
+        me.update(pos=[0, 0, 0], vel=[0, 0, 0])
+        bullet = {"kind": "gun", "pos": [-165, me["stats"]["radius"] + 0.9, 4],
+                  "vel": [252, 0, 0]}
+        obs["projectiles"] = [bullet]
+        self.assertIsNotNone(bot.projectile_threat(obs))
+        shell = {"kind": "mortar", "pos": [-70, 0, 24.75], "vel": [48, 0, 0]}
+        obs["projectiles"].append(shell)
+        with patch.object(bot.arena, "ground", return_value=0):
+            impact = bot.mortar_impact(shell, 22)
+            self.assertAlmostEqual(impact[0], 1.5, places=2)
+            self.assertAlmostEqual(abs(bot.projectile_threat(obs)), math.pi)
+
+    def test_weave_alternates_short_and_long_intervals(self):
+        bot = Bot(self.hello)
+        bot.weave_offset = 0
+        self.assertEqual(bot.weave_side(0.44), bot.turn_side)
+        self.assertEqual(bot.weave_side(0.46), -bot.turn_side)
+        self.assertEqual(bot.weave_side(1.04), -bot.turn_side)
+        self.assertEqual(bot.weave_side(1.06), bot.turn_side)
+
     def test_projectile_approach_and_height(self):
         bot = Bot(self.hello)
         obs = deepcopy(self.replay[0])
