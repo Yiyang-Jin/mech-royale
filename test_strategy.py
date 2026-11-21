@@ -1,8 +1,10 @@
 """Regression checks for the bot's geometry, mode signal and replay handling."""
+from collections import deque
 from copy import deepcopy
 import gzip
 import json
 from pathlib import Path
+import math
 import unittest
 from unittest.mock import patch
 from types import SimpleNamespace
@@ -140,6 +142,36 @@ class StrategyTests(unittest.TestCase):
             self.assertTrue(bot.navigation.drive(me, (0, 0), sprint=True, emergency=True)["boost"])
             me["energy"] = 70
             self.assertTrue(bot.navigation.drive(me, (0, 0), sprint=True)["boost"])
+
+    def test_route_looks_ahead_without_braking_at_intermediate_cells(self):
+        bot = self.make_bot()
+        nav = bot.navigation
+        me = deepcopy(self.replay[0]["self"])
+        me.update(pos=[0, 0, 0], vel=[5, 0, 0])
+        nav.graph = SimpleNamespace(
+            xyz=[(4, 0, 0), (8, 0, 0), (12, 0, 0), (16, 0, 0)], portals={}
+        )
+        nav.path = deque(range(4))
+        with patch.object(bot.arena, "walkable", return_value=True):
+            self.assertEqual(nav.follow_point(me), (12, 0, 0))
+            self.assertAlmostEqual(math.hypot(*nav.drive(me, (2, 0))["move"]), 1)
+            self.assertLess(math.hypot(*nav.drive(me, (0.7, 0), stop=True)["move"]), 1)
+            nav.graph.portals[(1, 2)] = object()
+            self.assertEqual(nav.follow_point(me), (8, 0, 0))
+
+    def test_kite_at_destination_strafes_full_speed_and_changes_side(self):
+        bot = self.make_bot()
+        nav = bot.navigation
+        obs = deepcopy(self.replay[0])
+        obs["self"].update(pos=[0, 0, 0], vel=[0, 0, 0])
+        target = {"id": 13, "pos": [70, 0, 0]}
+        nav.plan_key, nav.plan_at = ("kite", 13), 10
+        with patch.object(bot.arena, "walkable", return_value=True):
+            first, _ = nav.control(obs, [target], (0, 0), "kite", target, 70)
+            obs["t"] = 0.6
+            second, _ = nav.control(obs, [target], (0, 0), "kite", target, 70)
+        self.assertAlmostEqual(first["move"][1], 1)
+        self.assertAlmostEqual(second["move"][1], -1)
 
     def test_precomputed_graph_routes_out_of_a_u_shaped_wall(self):
         def wall(left, bottom, right, top):
@@ -280,7 +312,14 @@ class StrategyTests(unittest.TestCase):
         self.assertIsNone(nav.traverse(obs, Crossing(portal, True, 0)))
         me["energy"] = 100
         crossing = Crossing(portal, True, 0)
-        self.assertTrue(nav.traverse(obs, crossing)["jump"])
+        dx, dy = (roof[0] - launch[0]) / portal.crossing, (roof[1] - launch[1]) / portal.crossing
+        me.update(pos=[launch[0] - 1.5 * dx, launch[1] - 1.5 * dy, launch[2]],
+                  vel=[-dy * 8, dx * 8, 0])
+        with patch.object(bot.arena, "solid_between", return_value=False):
+            action = nav.traverse(obs, crossing)
+        self.assertTrue(action["jump"])
+        self.assertTrue(action["boost"])
+        self.assertAlmostEqual(math.hypot(*action["move"]), 1)
         obs["t"] = 0.2
         me.update(pos=[*launch[:2], roof[2] + 0.5], grounded=False)
         action = nav.traverse(obs, crossing)
@@ -296,7 +335,7 @@ class StrategyTests(unittest.TestCase):
         me.update(pos=list(launch), grounded=True)
         stalled = Crossing(portal, True, 1)
         self.assertTrue(nav.traverse(obs, stalled)["jump"])
-        obs["t"] = 1.6
+        obs["t"] = 1.3
         self.assertIsNone(nav.traverse(obs, stalled))
         self.assertGreater(nav.banned[portal], obs["t"])
 

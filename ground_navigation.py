@@ -2,7 +2,7 @@
 from collections import deque
 from dataclasses import dataclass
 from heapq import heappop, heappush, nlargest
-from itertools import pairwise
+from itertools import islice, pairwise
 import math
 from time import perf_counter
 
@@ -410,7 +410,7 @@ class Navigation:
                 break
         return best[1]
 
-    def drive(self, me, point, sprint=False, emergency=False, avoid=True):
+    def drive(self, me, point, sprint=False, emergency=False, avoid=True, stop=False):
         x, y, _ = me["pos"]
         dx, dy = point[0] - x, point[1] - y
         length = math.hypot(dx, dy)
@@ -422,7 +422,7 @@ class Navigation:
         running = (sprint and me["grounded"] and length > 6 and
                    me["energy"] - self.step * stats["boost_drain"] >= (24 if emergency else 65))
         limit = stats["boost_speed"] if running else stats["walk_speed"]
-        speed = min(limit, math.sqrt(2 * accel * max(0, length - 0.35)))
+        speed = min(limit, math.sqrt(2 * accel * max(0, length - 0.35))) if stop else limit
         ux, uy = dx / length, dy / length
         tangent = -uy * vx + ux * vy
         correction = max(-0.6 * speed, min(0.6 * speed, tangent * 0.8))
@@ -459,18 +459,31 @@ class Navigation:
             if me["energy"] < jet_energy(portal, stats) + 15:
                 self.banned[portal] = now + 3
                 return None
-            if gap(pos, launch) > 0.7:
-                return self.drive(me, launch)
-            if math.hypot(*me["vel"][:2]) > 1.25 or not me["grounded"]:
-                return {"move": [0, 0]}
-            radius = stats["radius"] + 0.35
-            if any(self.arena.solid_between((pos[0] + dx, pos[1] + dy, pos[2] + 0.12),
-                                            (pos[0] + dx, pos[1] + dy, landing[2] + stats["height"] + 0.75))
-                   for dx, dy in ((radius, 0), (-radius, 0), (0, radius), (0, -radius))):
+            if now - crossing.began >= 0.3 and (not me["grounded"] or gap(pos, launch) > 2.2):
                 self.banned[portal] = now + 6
                 return None
+            if gap(pos, launch) > 2.2:
+                return self.drive(me, launch)
+            if not me["grounded"]:
+                return self.drive(me, launch, avoid=False, stop=True)
+            radius = stats["radius"] + 0.35
             nx = (launch[1] - landing[1]) / portal.crossing
             ny = (landing[0] - launch[0]) / portal.crossing
+            vx, vy = me["vel"][:2]
+            tangent = vx * nx + vy * ny
+            direction = 1 if tangent >= 0 else -1
+            takeoff_move = [nx * direction, ny * direction]
+            inward = max(0, vx * ny - vy * nx)
+            drift = min(3, inward ** 2 / (2 * stats["air_accel"]))
+            check_positions = (pos[:2], (pos[0] + ny * drift, pos[1] - nx * drift))
+            if any(self.arena.solid_between((x + dx, y + dy, pos[2] + 0.12),
+                                            (x + dx, y + dy, landing[2] + stats["height"] + 0.75))
+                   for x, y in check_positions
+                   for dx, dy in ((radius, 0), (-radius, 0), (0, radius), (0, -radius))):
+                if now - crossing.began + 1e-6 >= 0.3:
+                    self.banned[portal] = now + 6
+                    return None
+                return {"move": takeoff_move}
             for offset in (-radius, radius):
                 ox, oy = nx * offset, ny * offset
                 if any(self.arena.solid_between((launch[0] + ox, launch[1] + oy, landing[2] + lift),
@@ -481,7 +494,17 @@ class Navigation:
             crossing.jumped_at = now
             crossing.progress_at = now
             crossing.peak = pos[2]
-            return {"move": [0, 0], "jump": True}
+            # Keep tangential motion while avoiding an input directly into the eave.
+            return {"move": takeoff_move, "jump": True, "boost": True}
+
+        if me["grounded"] and not crossing.crossing:
+            if now - crossing.jumped_at + 1e-6 >= 0.3:
+                self.banned[portal] = now + 6
+                return None
+            vx, vy = me["vel"][:2]
+            length = math.hypot(vx, vy)
+            return {"move": [vx / length, vy / length] if length > 0.2 else [0, 0],
+                    "jump": True, "boost": True}
 
         if me["energy"] < 1 and pos[2] < landing[2] + 0.7:
             self.banned[portal] = now + 6
@@ -493,16 +516,43 @@ class Navigation:
             if now - crossing.progress_at > 0.55:
                 self.banned[portal] = now + 6
                 return None
-            action = self.drive(me, launch, avoid=False) if gap(pos, launch) > 0.55 else {"move": [0, 0]}
+            action = self.drive(me, launch, avoid=False, stop=True) if gap(pos, launch) > 0.55 else {"move": [0, 0]}
             action["boost"] = not me["grounded"]
             return action
         if crossing.crossing and pos[2] < landing[2] - 0.5:
             self.banned[portal] = now + 6
             return None
         crossing.crossing = True
-        action = self.drive(me, landing, avoid=False)
+        action = self.drive(me, landing, avoid=False, stop=True)
         action["boost"] = not me["grounded"] and gap(pos, landing) > 1.25 and me["energy"] >= 1
         return action
+
+    def follow_point(self, me):
+        graph = self.graph
+        last = self.path[0]
+        for node in islice(self.path, 1, 5):
+            if (last, node) in graph.portals:
+                break
+            point = graph.xyz[node]
+            if (gap(me["pos"], point) > 12 or abs(point[2] - me["pos"][2]) > 2.5
+                    or not self.reachable(me, point)):
+                break
+            last = node
+        return graph.xyz[last]
+
+    def strafe_point(self, obs, target):
+        me, zone = obs["self"], obs["zone"]
+        x, y, _ = me["pos"]
+        tx, ty, _ = target["pos"]
+        side = -1 if int(obs["t"] / 0.6 + 1e-6) % 2 else 1
+        tangent = math.atan2(ty - y, tx - x) + side * math.pi / 2
+        for yaw in (tangent, tangent + math.pi):
+            point = (x + 8 * math.cos(yaw), y + 8 * math.sin(yaw))
+            if me["in_zone"] and gap(point, zone["center"]) > zone["radius"]:
+                continue
+            if not me["grounded"] or self.reachable(me, point):
+                return point
+        return None
 
     def emergency_direction(self, obs, influence):
         me = obs["self"]
@@ -594,7 +644,8 @@ class Navigation:
             here_pos = self.graph.xyz[here]
             portal = self.graph.portals.get((here, following))
             if portal is not None:
-                if gap(pos, here_pos) > 1.25:
+                arrival = 2.2 if here == portal.ground else 1.25
+                if gap(pos, here_pos) > arrival:
                     break
                 self.crossing = Crossing(portal, here == portal.ground, now)
                 action = self.traverse(obs, self.crossing)
@@ -603,17 +654,29 @@ class Navigation:
                 self.crossing = None
                 self.path.clear()
                 break
-            if gap(pos, here_pos) >= 2.4 or abs(pos[2] - here_pos[2]) > 2:
+            following_pos = self.graph.xyz[following]
+            ahead = (gap(pos, following_pos) + 1 < gap(pos, here_pos) and
+                     self.reachable(me, following_pos))
+            if (gap(pos, here_pos) >= 2.4 and not ahead) or abs(pos[2] - here_pos[2]) > 2:
                 break
             self.path.popleft()
+        if mode == "kite" and (
+            self.destination is None or gap(pos, self.graph.xyz[self.destination]) < 6
+        ):
+            strafe = self.strafe_point(obs, target)
+            if strafe is not None:
+                return self.drive(me, strafe, avoid=False), False
+        stop_at_shelter = False
         if self.path:
-            point = self.graph.xyz[self.path[0]]
+            point = self.follow_point(me)
             if mode == "travel" and len(self.path) == 1 and gap(point, goal) < 5 and self.reachable(me, goal):
                 point = goal
+            elif mode == "retreat" and point == self.graph.xyz[self.path[-1]] and gap(pos, point) < 8:
+                stop_at_shelter = influence.exposure(point, me["stats"]["height"] / 2)[0] == 0
         else:
             point = goal
         sprint = urgent or (mode == "retreat" and near < 90)
-        return self.drive(me, point, sprint=sprint, emergency=near < 20), False
+        return self.drive(me, point, sprint=sprint, emergency=near < 20, stop=stop_at_shelter), False
 
     def reachable(self, me, point):
         pos = me["pos"]
