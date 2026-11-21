@@ -2,6 +2,7 @@
 from copy import deepcopy
 import gzip
 import json
+import math
 from pathlib import Path
 import unittest
 from unittest.mock import patch
@@ -343,7 +344,7 @@ class StrategyTests(unittest.TestCase):
         weapon["cooldown"] = 1.65
         self.assertEqual(bot.cover_peek(obs, target)[0], (x, y))
 
-    def test_supply_eight_second_window_and_single_enemy_guard(self):
+    def test_supply_requires_clear_ring_and_approaches_contest_from_outside(self):
         bot = Bot(self.hello)
         obs = deepcopy(self.replay[0])
         x, y, z = obs["self"]["pos"]
@@ -351,10 +352,108 @@ class StrategyTests(unittest.TestCase):
         obs["drops"] = [drop]
         self.assertIsNone(bot.choose_supply(obs, []))
         drop["lands_in"] = 7.9
-        self.assertEqual(bot.choose_supply(obs, []), (drop, None))
-        foe = {"id": 12, "pos": drop["pos"]}
-        self.assertEqual(bot.choose_supply(obs, [foe]), (drop, foe))
-        self.assertIsNone(bot.choose_supply(obs, [foe, {"id": 13, "pos": [x + 55, y, z]}]))
+        self.assertEqual(bot.choose_supply(obs, []), (drop, None, drop["pos"][:2]))
+        foe = {"id": 12, "pos": [x + 126, y, z]}
+        with patch.object(bot.arena, "solid_between", return_value=True):
+            self.assertEqual(bot.choose_supply(obs, [foe]), (drop, None, drop["pos"][:2]))
+        with patch.object(bot.arena, "solid_between", return_value=False):
+            self.assertIsNone(bot.choose_supply(obs, [foe]))
+            obs["self"]["pos"] = drop["pos"][:]
+            _, contest, goal = bot.choose_supply(obs, [foe])
+            self.assertEqual(contest, foe)
+            self.assertGreater(math.dist(goal, drop["pos"][:2]), drop["radius"])
+
+    def test_quick_finish_and_covered_recovery_override_supply(self):
+        bot = Bot(self.hello)
+        obs = deepcopy(self.replay[0])
+        x, y, z = obs["self"]["pos"]
+        obs["zone"].update(center=[x, y], next_center=[x, y], radius=400, next_radius=320)
+        obs.update(t=95, projectiles=[], beams=[], events=[], sounds=[], mechs=[
+            {"id": 12, "kind": "mech", "pos": [x + 55, y, z], "hp": 200, "aim": [0, 0]},
+        ])
+        drop = {"id": 20, "pos": [x, y - 75, z], "radius": 8, "lands_in": 0, "holder": None}
+        with (patch.object(bot, "choose_supply", return_value=(drop, None, drop["pos"][:2])) as supply,
+              patch.object(bot.arena, "walkable", return_value=True),
+              patch.object(bot.arena, "clear_shot", return_value=True)):
+            action = bot.act(obs)
+            self.assertGreater(action["move"][0], 0)
+            obs["self"]["hp"] = 450
+            with patch.object(bot, "covered_for_recovery", return_value=True):
+                self.assertEqual(bot.act(obs)["fire"], [False, False])
+            supply.assert_not_called()
+
+    def test_late_charge_takes_turret_from_moving_targets_gun_lead(self):
+        bot = Bot(self.hello)
+        me = deepcopy(self.replay[0]["self"])
+        me.update(pos=[0, 0, 0], aim=[0.045, 0])
+        target = {"id": 12, "kind": "mech", "pos": [120, 0, 0], "vel": [0, 11.7, 0]}
+        stats = self.hello["config"]["weapons"]["laser"]
+        laser = {"kind": "laser", "stats": stats, "charge": 0.55, "cooldown": 1}
+        me["weapons"][1] = laser
+        with patch.object(bot.arena, "clear_shot", return_value=True):
+            action = {}
+            bot.attack(me, target, action)
+            self.assertAlmostEqual(action["aim"][0], 0)
+            self.assertEqual(action["fire"], [False, True])
+            laser["charge"] = stats["charge"]
+            me["aim"] = action["aim"]
+            bot.attack(me, target, action)
+            self.assertFalse(action["fire"][1])
+            laser["charge"] = 0
+            bot.attack(me, target, action)
+            self.assertGreater(action["aim"][0], 0.03)
+
+    def test_focus_persists_and_multi_enemy_corner_must_block_other_shooter(self):
+        bot = Bot(self.hello)
+        obs = deepcopy(self.replay[0])
+        me = obs["self"]
+        me["pos"] = [0, 0, 0]
+        target = {"id": 12, "kind": "mech", "pos": [90, 0, 0], "hp": 250}
+        other = {"id": 13, "kind": "mech", "pos": [50, 0, 0], "hp": 500}
+        with patch.object(bot.arena, "clear_shot", return_value=True):
+            self.assertIs(bot.select_target(me, [other, target]), target)
+            other["hp"] = 240
+            self.assertIs(bot.select_target(me, [other, target]), target)
+        with (patch.object(bot, "safe_destination", side_effect=lambda obs, point: point),
+              patch.object(bot.arena, "walkable", return_value=True),
+              patch.object(bot.arena, "ground", return_value=0),
+              patch.object(bot.arena, "clear_shot", return_value=True),
+              patch.object(bot.arena, "solid_between", side_effect=lambda start, end: end[1] < -3)):
+            goal, _ = bot.corner_position(obs, target, [other], me["weapons"][0])
+            self.assertLess(goal[1], -3)
+
+    def test_mortar_drops_without_swap_and_cube_detours_stop_at_cap(self):
+        bot = Bot(self.hello)
+        obs = deepcopy(self.replay[0])
+        me = obs["self"]
+        me["weapons"][1] = {"kind": "mortar"}
+        obs["pickups"] = [{"id": 200, "kind": "laser", "pos": me["pos"]}]
+        action = {}
+        bot.loot(obs, [{"pos": me["pos"], "weapons": ["laser"]}], action)
+        self.assertEqual(action, {"drop": 1})
+        for count, reach in ((9, 42), (10, 0), (14, 10), (15, 0), (20, 0)):
+            me["cubes"] = count
+            self.assertEqual(bot.cube_reach(me, 42), reach)
+
+    def test_retreat_keeps_front_toward_recent_shooter_and_bypasses_roof_transfer(self):
+        bot = Bot(self.hello)
+        obs = deepcopy(self.replay[0])
+        x, y, z = obs["self"]["pos"]
+        obs["self"]["hp"] = 500
+        obs["zone"].update(center=[x, y], next_center=[x, y], radius=400, next_radius=320)
+        obs.update(t=95, drops=[], projectiles=[], beams=[], sounds=[], events=[
+            {"type": "damaged", "bearing": math.pi},
+        ], mechs=[
+            {"id": 12, "kind": "mech", "pos": [x + 65, y, z], "hp": 1000, "aim": [0, 0]},
+        ])
+        with (patch.object(bot.arena, "walkable", return_value=True),
+              patch.object(bot, "attack", side_effect=lambda me, target, action: action.update(
+                  aim=[0, 0], fire=[True, False])),
+              patch.object(bot, "roof_escape") as roof):
+            action = bot.act(obs)
+        self.assertEqual(action["aim"], [math.pi, 0])
+        self.assertEqual(action["fire"], [False, False])
+        roof.assert_not_called()
 
     def test_drop_route_and_armor_pick_continue_when_aim_follows_sound(self):
         bot = Bot(self.hello)
