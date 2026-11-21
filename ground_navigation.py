@@ -11,7 +11,7 @@ DIRECTIONS = ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -
 TACTICAL_RADIUS = 95
 TACTICAL_NODE_LIMIT = 1800
 TRAVEL_NODE_LIMIT = 5000
-ALLOW_UPWARD_PORTALS = True
+ALLOW_UPWARD_PORTALS = False
 
 
 def gap(a, b):
