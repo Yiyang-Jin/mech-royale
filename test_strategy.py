@@ -52,13 +52,19 @@ class StrategyTests(unittest.TestCase):
         bullet = {"kind": "gun", "pos": [-165, me["stats"]["radius"] + 0.9, 4],
                   "vel": [252, 0, 0]}
         obs["projectiles"] = [bullet]
-        self.assertIsNotNone(bot.projectile_threat(obs))
+        self.assertEqual(bot.projectile_threat(obs), (None, False))
+        bullet["pos"] = [-100, me["stats"]["radius"] + 0.4, 4]
+        yaw, can_boost = bot.projectile_threat(obs)
+        self.assertIsNotNone(yaw)
+        self.assertFalse(can_boost)
         shell = {"kind": "mortar", "pos": [-70, 0, 24.75], "vel": [48, 0, 0]}
         obs["projectiles"].append(shell)
         with patch.object(bot.arena, "ground", return_value=0):
             impact = bot.mortar_impact(shell, 22)
             self.assertAlmostEqual(impact[0], 1.5, places=2)
-            self.assertAlmostEqual(abs(bot.projectile_threat(obs)), math.pi)
+            yaw, can_boost = bot.projectile_threat(obs)
+            self.assertAlmostEqual(abs(yaw), math.pi)
+            self.assertTrue(can_boost)
 
     def test_weave_alternates_short_and_long_intervals(self):
         bot = Bot(self.hello)
@@ -73,9 +79,18 @@ class StrategyTests(unittest.TestCase):
         obs = deepcopy(self.replay[0])
         obs["self"].update(pos=[0, 0, 0], vel=[0, 0, 0])
         obs["projectiles"] = [{"pos": [45, 1, 5], "vel": [-200, 0, 0], "kind": "gun"}]
-        self.assertLess(bot.projectile_threat(obs), 0)
+        self.assertLess(bot.projectile_threat(obs)[0], 0)
         obs["projectiles"][0]["pos"][2] = 35
-        self.assertIsNone(bot.projectile_threat(obs))
+        self.assertEqual(bot.projectile_threat(obs), (None, False))
+
+    def test_bullet_dodge_disables_boost_on_normal_entry(self):
+        bot = Bot(self.hello)
+        obs = deepcopy(self.replay[0])
+        obs["self"].update(grounded=True, energy=100)
+        for allow_boost in (False, True):
+            with (patch.object(bot, "projectile_threat", return_value=(0.2, allow_boost)),
+                  patch.object(bot.arena, "walkable", return_value=True)):
+                self.assertIs(bot.act(obs)["boost"], allow_boost)
 
     def test_kiting_uses_weapon_range(self):
         bot = Bot(self.hello)
@@ -210,6 +225,21 @@ class StrategyTests(unittest.TestCase):
             foe["pos"][0] = x + 85
             obs["pickups"] = [{"id": 8001, "kind": "laser", "pos": [x, y - 25, z]}]
             self.assertLess(bot.act(obs)["move"][1], -0.9)
+
+    def test_farm_fire_does_not_turn_past_front_armour_limit(self):
+        bot = Bot(self.hello)
+        obs = deepcopy(self.replay[0])
+        x, y, z = obs["self"]["pos"]
+        obs["zone"].update(center=[x, y], next_center=[x, y], radius=400, next_radius=320)
+        foe = {"id": 12, "kind": "mech", "pos": [x + 160, y, z], "hp": 1400, "aim": [0, 0]}
+        crate = {"id": 1001, "pos": [x, y + 25, z], "hp": 300}
+        obs.update(t=100, mechs=[foe], crates=[crate], cubes=[], drops=[], pickups=[],
+                   sounds=[], projectiles=[], events=[], beams=[])
+        with (patch.object(bot.arena, "clear_shot", return_value=True),
+              patch.object(bot.arena, "walkable", return_value=True)):
+            self.assertAlmostEqual(bot.act(obs)["aim"][0], 0)
+            crate["pos"] = [x + 20, y + 15, z]
+            self.assertAlmostEqual(bot.act(obs)["aim"][0], math.atan2(15, 20))
 
     def test_big_circle_keeps_range_with_laser_or_underarmed_gun(self):
         bot = Bot(self.hello)
@@ -573,8 +603,27 @@ class StrategyTests(unittest.TestCase):
               patch.object(bot, "laser_ray_hits", return_value=False),
               patch.object(bot, "aim", return_value=None)):
             self.assertTrue(bot.act(obs)["fire"][1])
-            obs["t"] = 91.8
+            obs["t"] = 90.2
+            self.assertTrue(bot.act(obs)["fire"][1])
+            obs["t"] = 90.3
             self.assertFalse(bot.act(obs)["fire"][1])
+            bot.laser_full_since = None
+            obs["mechs"][0]["pos"][0] = x + 50
+            obs["t"] = 91
+            self.assertTrue(bot.act(obs)["fire"][1])
+            obs["t"] = 91.1
+            self.assertFalse(bot.act(obs)["fire"][1])
+
+    def test_full_laser_selects_clear_enemy_when_first_target_is_blocked(self):
+        bot = Bot(self.hello)
+        me = deepcopy(self.replay[0]["self"])
+        stats = self.hello["config"]["weapons"]["laser"]
+        me["weapons"][1] = {"kind": "laser", "stats": stats, "charge": stats["charge"]}
+        first, other = {"id": 1}, {"id": 2}
+        with (patch.object(bot, "laser_ray_hits", return_value=False),
+              patch.object(bot, "aim", side_effect=lambda me, enemy, weapon:
+                           (0, 0, 0.03, 0.03) if enemy is other else None)):
+            self.assertIs(bot.laser_retarget(me, first, [first, other]), other)
 
     def test_recorded_observations_without_wrapper_fallback(self):
         bot = Bot(self.hello)

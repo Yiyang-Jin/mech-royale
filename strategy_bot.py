@@ -102,6 +102,7 @@ class Bot:
         self.frame_time = 0.0
         self.collect_until = -math.inf
         self.laser_full_since = None
+        self.laser_hold_limit = 0.30
         self.laser_unsafe = False
         self.focus_id = None
         self.peek = None
@@ -282,7 +283,8 @@ class Bot:
                 ready = weapon["cooldown"] <= self.turn_step
                 ray_clear = full and self.laser_ray_hits(me, target, weapon)
                 hold = (charge > 0 and not ray_clear and
-                        (not full or self.frame_time - self.laser_full_since + 1e-6 < 1.8))
+                        (not full or self.frame_time - self.laser_full_since + self.turn_step
+                         <= self.laser_hold_limit + 1e-6))
                 fire[slot] = hold
                 if ray_clear:
                     options.append(Shot(slot, yaw, pitch, 0.0, 0.0, 100, False))
@@ -388,22 +390,40 @@ class Bot:
             if speed_squared < 1:
                 continue
             t = -(dx * rx + dy * ry) / speed_squared
-            if not 0 < t < (0.45 if shell else 0.85):
+            if not 0 < t < (0.45 if shell else 0.50):
                 continue
             closest = dx + rx * t, dy + ry * t
-            clearance = radius + (mortar["splash_radius"] if shell else 1.2)
+            clearance = radius + (mortar["splash_radius"] if shell else 0.45)
             height = pz - z + (sz - vz) * t - (mortar["gravity"] * t * t / 2 if shell else 0)
             if math.hypot(*closest) >= clearance or not -0.5 <= height <= me["stats"]["height"] + 0.5:
                 continue
             side = 1 if ry * closest[0] - rx * closest[1] >= 0 else -1
             dodge = math.atan2(rx * side, -ry * side)
             if best is None or t < best[0]:
-                best = t, dodge
+                best = t, dodge, shell
         if landing is not None:
-            return landing[1]
+            return landing[1], True
         if best is not None:
-            return best[1]
-        return None
+            return best[1], best[2]
+        return None, False
+
+    def laser_retarget(self, me, target, enemies):
+        if target is None or self.laser_unsafe or not enemies:
+            return target
+        laser = next((w for w in me["weapons"] if w and w["kind"] == "laser"
+                      and w.get("charge", 0) + 1e-6 >= w["stats"]["charge"]), None)
+        if laser is None or self.laser_ray_hits(me, target, laser) or self.aim(me, target, laser) is not None:
+            return target
+        candidates = []
+        for enemy in enemies:
+            if enemy["id"] == target.get("id"):
+                continue
+            solution = self.aim(me, enemy, laser)
+            if solution is not None:
+                turn = max(abs(angle_error(solution[0], me["aim"][0])) / me["stats"]["turn_rate"],
+                           abs(solution[1] - me["aim"][1]) / me["stats"]["pitch_rate"])
+                candidates.append((turn, enemy))
+        return min(candidates, key=lambda item: item[0])[1] if candidates else target
 
     def planning_circle(self, obs):
         zone = obs["zone"]
@@ -1027,6 +1047,7 @@ class Bot:
 
         nearest = enemies[0] if enemies else None
         near_dist = distance(pos, nearest["pos"]) if nearest else math.inf
+        self.laser_hold_limit = 0.15 if near_dist <= 60 else 0.30
         self.laser_unsafe = any(distance(pos, e["pos"]) <= 45 and "lightning" in e.get("weapons", ())
                                 for e in enemies)
         recently_hit = now - self.last_damage < 2
@@ -1041,6 +1062,7 @@ class Bot:
             or e.get("hp", math.inf) < 0.26 * e.get("max_hp", 1400)
             or self.other_fight_until.get(e["id"], -1) > now]
         target = self.select_target(me, candidates)
+        enemy_target = target
         recover_covered = (self.recovering and me["grounded"] and not recently_hit
                            and self.covered_for_recovery(me, enemies, tactics))
         if recover_covered:
@@ -1205,7 +1227,8 @@ class Bot:
         # Dash back across the current circle boundary before pursuing the next circle.
         if not me["in_zone"] and distance(pos, goal) < 2:
             goal = zone["center"]
-        dodge = self.projectile_threat(obs)
+        dodge, shell_dodge = self.projectile_threat(obs)
+        bullet_dodge = dodge is not None and not shell_dodge
         if dodge is None and nearest and nearest.get("charging") and near_dist < 145:
             aim_error = angle_error(bearing(nearest["pos"], pos), nearest["aim"][0])
             if abs(aim_error) < 0.16:
@@ -1220,6 +1243,8 @@ class Bot:
                                        or (recovery_stalled and target is not None and recovery_route is None))
         self.move(me, goal, action, dodge, urgent_zone or (escaping and near_dist < 95),
                   quiet and dodge is None and not urgent_zone, cover_from if escaping else None)
+        if bullet_dodge:
+            action["boost"] = False
         boost_route = ((developing and distance(pos, goal) > 9)
                        or (execute and not urgent_zone and distance(pos, target["pos"]) > 50)
                        or (supply is not None and supply[1] is None and distance(pos, goal) > 24))
@@ -1240,7 +1265,16 @@ class Bot:
             self.sound_until = -math.inf
             look = threat_bearing
         action["aim"] = list(peek_plan[1]) if peek_plan else [look, 0.0]
+        default_aim = action["aim"]
+        target = self.laser_retarget(me, target, enemies)
         self.attack(me, target, action)
+        if (target is not None and target.get("kind") != "mech"
+                and any(distance(pos, enemy["pos"]) <= 220
+                        and abs(angle_error(bearing(pos, enemy["pos"]), action["aim"][0])) > math.radians(65)
+                        for enemy in enemies)):
+            target = self.laser_retarget(me, enemy_target, enemies)
+            action["aim"] = default_aim
+            self.attack(me, target, action)
         if (escaping or urgent_zone) and threat_bearing is not None:
             shooter = next((e for e in enemies if e.get("charging") and distance(pos, e["pos"]) <= 200), None)
             front = bearing(pos, shooter["pos"]) if shooter else (
