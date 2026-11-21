@@ -87,7 +87,15 @@ class Bot:
         self.pvp = False
         self.recovering = False
         self.scan = hello["slot"] * math.tau / match["mechs"]
+        self.scout_waypoint = None
+        self.scout_until = -math.inf
+        self.scout_turn = 0
         self.turn_side = 1 if hello["slot"] % 2 else -1
+        self.weave_offset = hello["slot"] * 0.083
+        self.roof = None
+        self.roof_phase = "approach"
+        self.roof_deadline = -math.inf
+        self.roof_retry = -math.inf
 
     def update_situation(self, obs, enemies):
         now = obs["t"]
@@ -290,7 +298,10 @@ class Bot:
             return goal
         return tuple(c + (p - c) * extent / d for c, p in zip(center, goal))
 
-    def kite_goal(self, me, target, tactics):
+    def weave_side(self, now):
+        return self.turn_side * (-1 if int((now + self.weave_offset) / 0.78) % 2 else 1)
+
+    def kite_goal(self, me, target, tactics, now=0):
         pos = me["pos"]
         gap = distance(pos, target["pos"])
         facing = bearing(pos, target["pos"])
@@ -314,7 +325,8 @@ class Bot:
             ideal *= 1.4
         # Blend strafe and range correction smoothly across the preferred band.
         correction = max(-1, min(1, (gap - ideal) / tactics.kite_band))
-        yaw = facing + self.turn_side * (1 - correction) * math.pi / 2
+        side = self.weave_side(now) if 24 < gap < 155 else self.turn_side
+        yaw = facing + side * (1 - correction) * math.pi / 2
         return pos[0] + 32 * math.cos(yaw), pos[1] + 32 * math.sin(yaw)
 
     def covered_for_recovery(self, me, enemies, tactics):
@@ -323,7 +335,8 @@ class Bot:
         muzzle = self.config["mech"]["muzzle_height"]
         for enemy in enemies:
             ex, ey, ez = enemy["pos"]
-            if distance(pos, enemy["pos"]) < tactics.cover_hold_distance:
+            if (distance(pos, enemy["pos"]) < tactics.cover_hold_distance
+                    and pos[2] - ez < 8):
                 return False
             scale = 1 + self.config["cubes"]["size_per_cube"] * enemy.get("cubes", 0)
             if not self.arena.solid_between((ex, ey, ez + muzzle * scale), eye):
@@ -365,6 +378,76 @@ class Bot:
         action["move"] = [math.cos(best_yaw) * magnitude, math.sin(best_yaw) * magnitude]
         action["boost"] = (hurry or dodge is not None) and me["grounded"] and me["energy"] > 24
 
+    def roof_escape(self, obs, enemies, action, enabled, urgent_zone):
+        now, me = obs["t"], obs["self"]
+        pos = me["pos"]
+        if urgent_zone or now > self.roof_deadline:
+            self.roof = None
+        if urgent_zone:
+            return False
+        if self.roof is None:
+            if not enabled or not enemies or now < self.roof_retry or not me["grounded"] or me["energy"] < 42:
+                return False
+            self.roof_retry = now + 2
+            stats = me["stats"]
+            muzzle = self.config["mech"]["muzzle_height"]
+            candidates = []
+            for roof in self.arena.roof_entries(me):
+                if distance(roof.shelter, self.safe_destination(obs, roof.shelter)) > 2:
+                    continue
+                if any(distance(roof.launch, e["pos"]) < 19 for e in enemies):
+                    continue
+                eye = (*roof.shelter, roof.top + stats["eye_height"])
+                cover = [self.arena.solid_between((e["pos"][0], e["pos"][1], e["pos"][2] + muzzle), eye)
+                         for e in enemies]
+                if cover[0]:
+                    cost = distance(pos, roof.launch) + roof.energy * 0.22
+                    candidates.append((cost - sum(cover) * 18, roof))
+            if not candidates:
+                return False
+            self.roof = min(candidates, key=lambda item: item[0])[1]
+            self.roof_phase = "approach"
+            self.roof_deadline = now + 11
+        roof = self.roof
+        if self.roof_phase == "approach":
+            gap = distance(pos, roof.launch)
+            if gap > 2:
+                self.move(me, roof.launch, action, None, False, False)
+                if gap < 7 and "move" in action:
+                    action["move"] = [component * 0.45 for component in action["move"]]
+                return True
+            if math.hypot(*me["vel"][:2]) > 2.5:
+                action["move"] = [0, 0]
+                return True
+            if not me["grounded"] or me["energy"] < roof.energy - 2:
+                self.roof = None
+                return False
+            self.roof_phase = "climb"
+        if self.roof_phase == "climb" and pos[2] < roof.top + 0.8:
+            if me["energy"] < 8:
+                self.roof = None
+                return False
+            action.update(move=[0, 0], jump=me["grounded"], boost=not me["grounded"])
+            return True
+
+        self.roof_phase = "cross"
+        if distance(pos, roof.shelter) < 2.5 and me["grounded"]:
+            self.roof = None
+            self.roof_retry = now + 5
+            return False
+        if pos[2] < roof.top - 0.5 or (me["energy"] < 2 and pos[2] < roof.top + 0.8):
+            self.roof = None
+            return False
+        dx, dy = roof.landing[0] - roof.launch[0], roof.landing[1] - roof.launch[1]
+        past_edge = dx * (pos[0] - roof.landing[0]) + dy * (pos[1] - roof.landing[1]) >= 0
+        if distance(pos, roof.shelter) < 2.5:
+            action["move"] = [0, 0]
+        else:
+            yaw = bearing(pos, roof.shelter)
+            action["move"] = [math.cos(yaw), math.sin(yaw)]
+        action["boost"] = not past_edge and not me["grounded"] and me["energy"] >= 2
+        return True
+
     def loot(self, obs, enemies, action):
         me = obs["self"]
         pos, weapons = me["pos"], me["weapons"]
@@ -395,6 +478,67 @@ class Bot:
             break
         return candidates
 
+    def resource_goal(self, obs, pickups, enemies):
+        me = obs["self"]
+        pos = me["pos"]
+        needs_weapon = None in me["weapons"]
+        needs_cubes = me["cubes"] < self.config["cubes"]["stat_cap"]
+        options = []
+        if needs_weapon:
+            for pickup in pickups:
+                bonus = {"laser": 12, "lightning": 7, "mortar": 4}.get(pickup["kind"])
+                if bonus is not None:
+                    options.append((pickup["pos"], 99 + bonus, 105))
+        if needs_cubes:
+            for cube in obs["cubes"]:
+                if abs(cube["pos"][2] - pos[2]) <= 4:
+                    options.append((cube["pos"], 65, 43))
+
+        ranked = []
+        for point, value, reach in options:
+            gap = distance(pos, point)
+            if 1 < gap <= reach and distance(point, self.safe_destination(obs, point[:2])) < 2:
+                ranked.append((value - gap * 0.7, point, gap))
+        best = None
+        for score, point, gap in sorted(ranked, key=lambda option: option[0], reverse=True)[:8]:
+            dx, dy = point[0] - pos[0], point[1] - pos[1]
+            clearance = math.inf
+            for enemy in enemies:
+                ex, ey = enemy["pos"][0] - pos[0], enemy["pos"][1] - pos[1]
+                fraction = max(0, min(1, (ex * dx + ey * dy) / (gap * gap)))
+                clearance = min(clearance, math.hypot(ex - fraction * dx, ey - fraction * dy))
+            if clearance < 34:
+                continue
+            if self.arena.solid_between((pos[0], pos[1], pos[2] + 4),
+                                        (point[0], point[1], point[2] + 4)):
+                score -= 32
+            score -= max(0, 80 - clearance) * 0.55
+            if score > 15 and (best is None or score > best[0]):
+                best = score, tuple(point[:2])
+        return best[1] if best else None
+
+    def scout_goal(self, obs):
+        pos = obs["self"]["pos"]
+        now = obs["t"]
+        if (self.scout_waypoint is not None and now < self.scout_until
+                and distance(pos, self.scout_waypoint) > 8):
+            return self.scout_waypoint
+        center = obs["zone"]["next_center"]
+        distance_to_center = distance(pos, center)
+        if distance_to_center > 105:
+            offset = 0.22 + 0.48 * (self.scout_turn % 3)
+            yaw = bearing(pos, center) + self.turn_side * offset
+        else:
+            yaw = self.scan + self.scout_turn * 2.39996
+        x, y = pos[0] + 85 * math.cos(yaw), pos[1] + 85 * math.sin(yaw)
+        bounds = self.arena.bounds
+        waypoint = (max(bounds["minX"] + 12, min(x, bounds["maxX"] - 12)),
+                    max(bounds["minY"] + 12, min(y, bounds["maxY"] - 12)))
+        self.scout_waypoint = self.safe_destination(obs, waypoint)
+        self.scout_until = now + 7.5
+        self.scout_turn += 1
+        return self.scout_waypoint
+
     def act(self, obs: mf.Observation) -> mf.Action:
         me = obs["self"]
         pos = me["pos"]
@@ -424,8 +568,14 @@ class Bot:
             or e.get("hp", math.inf) < 0.26 * e.get("max_hp", 1400)
             or self.other_fight_until.get(e["id"], -1) > now), None)
         if disengage:
-            # A distant hit restarts the heal timer even if it lands while retreating.
-            target = nearest if near_dist < 20 else None
+            # Only shoot through recovery when a close attacker can still hit us.
+            target = None
+            if nearest and near_dist < 20 and (recently_hit or near_dist < 10):
+                tx, ty, tz = nearest["pos"]
+                muzzle = self.config["mech"]["muzzle_height"]
+                if self.arena.clear_shot((tx, ty, tz + muzzle),
+                                         (pos[0], pos[1], pos[2] + me["stats"]["height"] / 2)):
+                    target = nearest
 
         action: mf.Action = {"tick": obs["tick"]}
         if obs["offer"]:
@@ -443,26 +593,32 @@ class Bot:
 
         goal = zone_goal
         quiet = False
+        recover_covered = (self.recovering and me["grounded"] and not recently_hit
+                           and self.covered_for_recovery(me, enemies, tactics))
         if not urgent_zone:
+            resources = None
+            if not self.pvp and not disengage and not recently_hit and near_dist > 42:
+                resources = self.resource_goal(obs, loot, enemies)
             drops = [d for d in obs["drops"] if d["lands_in"] == 0 and d["holder"] in (None, me["id"])
                      and hp < 0.78 and not enemies and not recently_hit
                      and distance(pos, d["pos"]) < 42]
             if drops:
                 goal = min(drops, key=lambda d: distance(pos, d["pos"]))["pos"][:2]
-            elif (self.recovering and me["grounded"] and not recently_hit
-                  and self.covered_for_recovery(me, enemies, tactics)):
+            elif recover_covered:
                 goal = zone_goal
             elif threat_bearing is not None and (disengage or (self.pvp and target is None and near_dist < 70)):
-                away = threat_bearing + math.pi + 0.22 * self.turn_side
+                away = threat_bearing + math.pi + 0.33 * self.weave_side(now)
                 goal = (pos[0] + 40 * math.cos(away), pos[1] + 40 * math.sin(away))
+            elif resources is not None:
+                goal = resources
             elif target is not None:
-                goal = self.kite_goal(me, target, tactics)
+                goal = self.kite_goal(me, target, tactics, now)
             elif not disengage:
                 cubes = [c for c in obs["cubes"] if abs(c["pos"][2] - pos[2]) < 4]
                 cap = self.config["cubes"]["stat_cap"] if not self.pvp else 6
-                if cubes and me["cubes"] < cap and not active_enemies:
+                if self.pvp and cubes and me["cubes"] < cap and not active_enemies:
                     goal = min(cubes, key=lambda c: distance(pos, c["pos"]))["pos"][:2]
-                elif None in me["weapons"] and loot and not active_enemies:
+                elif self.pvp and None in me["weapons"] and loot and not active_enemies:
                     goal = min(loot, key=lambda p: distance(pos, p["pos"]))["pos"][:2]
                 elif not enemies and me["cubes"] < cap and not recently_hit:
                     farm = [a for a in (*obs["crates"], *obs["mechs"])
@@ -473,7 +629,7 @@ class Bot:
                 elif self.pvp and near_dist > 70:
                     quiet = True
         if distance(pos, goal) < 2 and target is None and not disengage and not self.pvp:
-            goal = (pos[0] + 25 * math.cos(self.scan), pos[1] + 25 * math.sin(self.scan))
+            goal = self.scout_goal(obs)
         goal = self.safe_destination(obs, goal)
         # Dash back across the current circle boundary before pursuing the next circle.
         if not me["in_zone"] and distance(pos, goal) < 2:
@@ -487,8 +643,14 @@ class Bot:
         if nearest and disengage and not urgent_zone and dodge is None:
             tx, ty, tz = nearest["pos"]
             cover_from = (tx, ty, tz + self.config["mech"]["muzzle_height"])
-        self.move(me, goal, action, dodge, urgent_zone or (disengage and near_dist < 95),
-                  quiet and dodge is None and not urgent_zone, cover_from)
+        roof_needed = (not self.pvp and not recover_covered and near_dist < 110
+                       and (self.recovering or len(active_enemies) >= 2))
+        climbing = self.roof_escape(obs, active_enemies, action, roof_needed, urgent_zone)
+        if climbing:
+            target = None
+        else:
+            self.move(me, goal, action, dodge, urgent_zone or (disengage and near_dist < 95),
+                      quiet and dodge is None and not urgent_zone, cover_from)
 
         if threat_bearing is None:
             self.scan = math.remainder(self.scan + 0.055, math.tau)
@@ -504,7 +666,8 @@ class Bot:
             action["reload"] = gun["ammo"] == 0 or (target is None and (near_dist > 65 or disengage))
         mode = "FFA" if self.pvp else "practice"
         recovering = self.recovering and now - self.last_combat >= me["stats"]["regen_delay"]
-        mf.draw.label(f"{mode} | {'healing' if recovering else 'retreat' if disengage else 'active'}")
+        state = "roof" if climbing else "healing" if recovering else "retreat" if disengage else "active"
+        mf.draw.label(f"{mode} | {state}")
         return action
 
 

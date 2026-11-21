@@ -6,7 +6,7 @@ from pathlib import Path
 import unittest
 from unittest.mock import patch
 
-from arena_geometry import Prism
+from arena_geometry import Prism, RoofEntry
 from strategy_bot import Bot, PRACTICE, intercept
 
 
@@ -116,6 +116,91 @@ class StrategyTests(unittest.TestCase):
             self.assertIn("move", bot.act(obs))
         me["in_zone"] = False
         self.assertIn("move", bot.act(obs))
+
+    def test_can_move_to_weapon_while_still_shooting(self):
+        bot = Bot(self.hello)
+        obs = deepcopy(self.replay[0])
+        me = obs["self"]
+        x, y, z = me["pos"]
+        me["aim"] = [0, 0]
+        pickup = {"id": 8000, "kind": "laser", "pos": [x, y + 52, z]}
+        enemy = {"id": 12, "kind": "mech", "pos": [x + 65, y, z],
+                 "hp": 1400, "max_hp": 1400, "aim": [0, 0]}
+        obs.update(mechs=[enemy], pickups=[pickup], cubes=[], drops=[], projectiles=[])
+        with (patch.object(bot.arena, "solid_between", return_value=False),
+              patch.object(bot.arena, "walkable", return_value=True),
+              patch.object(bot, "aim", return_value=(0, 0, 0.04, 0.04))):
+            action = bot.act(obs)
+            self.assertGreater(action["move"][1], 0.99)
+            self.assertEqual(action["fire"], [True, False])
+            enemy["pos"] = [x, y + 65, z]
+            self.assertIsNone(bot.resource_goal(obs, [pickup], [enemy]))
+
+    def test_scout_keeps_waypoint_while_torso_scans(self):
+        bot = Bot(self.hello)
+        obs = deepcopy(self.replay[0])
+        waypoint = bot.scout_goal(obs)
+        bot.scan += 2
+        obs["t"] += 4
+        self.assertEqual(bot.scout_goal(obs), waypoint)
+        obs["t"] += 4
+        self.assertNotEqual(bot.scout_goal(obs), waypoint)
+
+    def test_kiting_reverses_tangent_without_giving_up_range(self):
+        bot = Bot(self.hello)
+        me = deepcopy(self.replay[0]["self"])
+        me["pos"] = [0, 0, 0]
+        target = {"pos": [65, 0, 0]}
+        a = bot.kite_goal(me, target, PRACTICE, 0)
+        b = bot.kite_goal(me, target, PRACTICE, 0.78)
+        self.assertAlmostEqual(a[0], b[0])
+        self.assertAlmostEqual(a[1], -b[1])
+
+    def test_roof_geometry_finds_clear_entry_and_respects_energy(self):
+        bot = Bot(self.hello)
+        me = deepcopy(self.replay[0]["self"])
+        me["pos"] = [-240, -125, bot.arena.ground(-240, -125)]
+        roofs = list(bot.arena.roof_entries(me))
+        self.assertTrue(roofs)
+        self.assertLess(roofs[0].top - me["pos"][2], 40)
+        self.assertLess(roofs[0].energy, me["energy"])
+        me["energy"] = 15
+        self.assertFalse(list(bot.arena.roof_entries(me)))
+
+    def test_roof_escape_jumps_then_climbs_before_crossing(self):
+        bot = Bot(self.hello)
+        obs = deepcopy(self.replay[0])
+        me = obs["self"]
+        me.update(pos=[0, 0, 0], vel=[0, 0, 0])
+        obstacle = RoofEntry((0, 0), (12, 0), (19, 0), 15, 60)
+        enemies = [{"pos": [-25, 0, 0]}]
+        action = {}
+        with (patch.object(bot.arena, "roof_entries", return_value=[obstacle]),
+              patch.object(bot.arena, "solid_between", return_value=True)):
+            self.assertTrue(bot.roof_escape(obs, enemies, action, True, False))
+        self.assertTrue(action["jump"])
+        me.update(pos=[0, 0, 7], grounded=False)
+        action.clear()
+        self.assertTrue(bot.roof_escape(obs, enemies, action, True, False))
+        self.assertTrue(action["boost"])
+        self.assertEqual(action["move"], [0, 0])
+        me["pos"][2] = 16
+        self.assertTrue(bot.roof_escape(obs, enemies, action, True, False))
+        self.assertEqual(action["move"], [1, 0])
+        me.update(pos=[19, 0, 15], grounded=True)
+        self.assertFalse(bot.roof_escape(obs, enemies, {}, True, False))
+
+    def test_close_but_occluded_enemy_does_not_break_recovery(self):
+        bot = Bot(self.hello)
+        obs = deepcopy(self.replay[0])
+        me = obs["self"]
+        me["hp"] = me["max_hp"] * 0.4
+        x, y, z = me["pos"]
+        obs["mechs"] = [{"id": 12, "kind": "mech", "pos": [x - 9, y, z], "aim": [0, 0]}]
+        with (patch.object(bot.arena, "clear_shot", return_value=False),
+              patch.object(bot, "attack", wraps=bot.attack) as attack):
+            bot.act(obs)
+        self.assertIsNone(attack.call_args.args[1])
 
     def test_recorded_observations_without_wrapper_fallback(self):
         bot = Bot(self.hello)

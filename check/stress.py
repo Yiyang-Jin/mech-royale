@@ -21,8 +21,15 @@ def read_cases(hello, observation, arena):
         z = arena.ground(x, y)
         kind = ("laser", "mortar", "lightning")[index % 3]
         me.update(pos=[x, y, z], hp=me["max_hp"] * (0.44 if index % 4 == 0 else 1))
-        me["weapons"][1] = {"kind": kind, "stats": hello["config"]["weapons"][kind], "cooldown": 0}
-        obs.update(events=[], sounds=[], beams=[], pickups=[], mechs=[], projectiles=[], drops=[])
+        me["weapons"][1] = (None if index % 4 == 2 else
+                            {"kind": kind, "stats": hello["config"]["weapons"][kind], "cooldown": 0})
+        obs.update(events=[], sounds=[], beams=[], pickups=[], cubes=[], mechs=[], projectiles=[], drops=[])
+        for i in range(8):
+            yaw = index + i * math.tau / 8
+            dx, dy = math.cos(yaw), math.sin(yaw)
+            obs["pickups"].append({"id": 8000 + i, "kind": kind,
+                                   "pos": [x + 52 * dx, y + 52 * dy, z]})
+            obs["cubes"].append({"id": 5000 + i, "pos": [x + 27 * dx, y + 27 * dy, z]})
         for i in range(15):
             yaw = index + i * math.tau / 15
             radius = 17 if i == 0 and index % 4 == 1 else 75 if i == 0 else 120 + i * 3
@@ -63,6 +70,8 @@ def main():
         # Revisit all decision paths independently of health hysteresis in earlier cases.
         bot.pvp = frame % 5 == 0
         bot.recovering = False
+        bot.roof = None
+        bot.roof_retry = -math.inf
         start = perf_counter()
         action = bot.act(obs)
         times.append((perf_counter() - start) * 1000)
