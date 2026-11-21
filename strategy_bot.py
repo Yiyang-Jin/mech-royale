@@ -102,6 +102,7 @@ class Bot:
         self.collect_until = -math.inf
         self.laser_full_since = None
         self.laser_unsafe = False
+        self.last_lightning_hit = -math.inf
         self.focus_id = None
         self.peek = None
         self.peek_precharge = False
@@ -124,6 +125,8 @@ class Bot:
             kind = event["type"]
             if kind in ("damaged", "hit"):
                 self.last_combat = now
+            if kind == "damaged" and event.get("weapon") == "lightning":
+                self.last_lightning_hit = now
             if kind == "kill":
                 self.kills.add(event["target"])
                 self.last_combat = now
@@ -273,12 +276,18 @@ class Bot:
                     self.laser_full_since = self.frame_time
                 elif not full:
                     self.laser_full_since = None
-                if self.laser_unsafe:
+                min_charge = stats["min_charge"]
+                under_lightning = self.laser_unsafe and self.frame_time - self.last_lightning_hit < 0.3
+                if under_lightning and charge == 0:
                     continue
-                laser_owns_aim = charge >= min(0.50, stats["charge"])
+                quick_release = self.laser_unsafe and charge + 1e-6 >= min_charge
+                laser_owns_aim = charge >= min(0.50, stats["charge"]) or (
+                    self.laser_unsafe and charge > 0
+                )
                 ready = weapon["cooldown"] <= self.turn_step
-                ray_clear = full and self.laser_ray_hits(me, target, weapon)
+                ray_clear = (full or quick_release) and self.laser_ray_hits(me, target, weapon)
                 hold = (charge > 0 and not ray_clear and
+                        not (quick_release and under_lightning) and
                         (not full or self.frame_time - self.laser_full_since + 1e-6 < 1.8))
                 fire[slot] = hold
                 if ray_clear:
@@ -538,13 +547,12 @@ class Bot:
             return {"mortar": 1, "gun": 2, "laser": 3, "lightning": 4}
         return {"mortar": 1, "gun": 2, "lightning": 3, "laser": 4}
 
-    def replacement_slot(self, weapons, kind, order, zone_radius=math.inf, enemy_distance=math.inf):
+    def replacement_slot(self, weapons, kind, order, allow_combo=False):
         eligible = [
             i for i, old in enumerate(weapons)
             if order[kind] > order[old["kind"]] and not old.get("charge", 0)
             and (old["kind"] != "gun"
-                 or ({kind, weapons[1 - i]["kind"]} == {"laser", "lightning"}
-                     and (zone_radius <= 100 or enemy_distance < 55)))
+                 or (allow_combo and {kind, weapons[1 - i]["kind"]} == {"laser", "lightning"}))
         ]
         return min(eligible, key=lambda i: order[weapons[i]["kind"]], default=None)
 
@@ -565,19 +573,26 @@ class Bot:
             action["drop"] = mortar_slot
             return candidates
         near = min((distance(pos, enemy["pos"]) for enemy in enemies), default=math.inf)
+        allow_combo = self.allow_close_loadout(obs, near)
         for item in candidates:
             if distance(pos, item["pos"]) > reach:
                 continue
             if None not in weapons:
-                if enemies and not opening and not (item["kind"] == "lightning" and near < 55):
-                    continue
-                slot = self.replacement_slot(weapons, item["kind"], order, obs["zone"]["radius"], near)
+                slot = self.replacement_slot(weapons, item["kind"], order, allow_combo)
                 if slot is None:
+                    continue
+                if enemies and not opening and not (
+                    weapons[slot]["kind"] == "gun" and allow_combo
+                    or item["kind"] == "lightning" and near < 55
+                ):
                     continue
                 action["drop"] = slot
             action["take"] = item["id"]
             break
         return candidates
+
+    def allow_close_loadout(self, obs, near):
+        return obs["zone"]["radius"] <= 100 or obs["t"] > 65 or len(self.kills) >= 2 or near < 85
 
     def cube_reach(self, me, below_cap):
         cubes = me["cubes"]
@@ -597,8 +612,9 @@ class Bot:
             near = min((distance(pos, enemy["pos"]) for enemy in enemies), default=math.inf)
             for pickup in pickups:
                 kind = pickup["kind"]
-                if needs_weapon or self.replacement_slot(me["weapons"], kind, order,
-                                                         obs["zone"]["radius"], near) is not None:
+                slot = None if needs_weapon else self.replacement_slot(
+                    me["weapons"], kind, order, self.allow_close_loadout(obs, near))
+                if needs_weapon or slot is not None:
                     value = 96 + 10 * order[kind] + (40 if kind == preferred else 0)
                     options.append((pickup["pos"], value, 140 if opening else 105))
         if cube_reach:

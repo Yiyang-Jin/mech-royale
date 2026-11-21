@@ -245,7 +245,7 @@ class StrategyTests(unittest.TestCase):
         self.assertIsNotNone(attack.call_args.args[1])
         self.assertEqual(action["fire"], [False, False])
 
-    def test_full_laser_waits_for_visible_ray_but_releases_after_grace_or_near_lightning(self):
+    def test_full_laser_waits_for_visible_ray_but_releases_after_grace_or_lightning_hit(self):
         bot = Bot(self.hello)
         me = deepcopy(self.replay[0]["self"])
         laser = self.hello["config"]["weapons"]["laser"]
@@ -261,8 +261,26 @@ class StrategyTests(unittest.TestCase):
             self.assertEqual(action["fire"], [False, False])
             bot.frame_time = 10.5
             bot.laser_unsafe = True
+            bot.last_lightning_hit = 10.4
             bot.attack(me, {}, action)
             self.assertEqual(action["fire"], [False, False])
+
+    def test_close_laser_starts_and_releases_at_minimum_charge(self):
+        bot = Bot(self.hello)
+        me = deepcopy(self.replay[0]["self"])
+        stats = self.hello["config"]["weapons"]["laser"]
+        laser = {"kind": "laser", "stats": stats, "cooldown": 0, "charge": 0}
+        me["weapons"] = [None, laser]
+        target = {"kind": "mech", "pos": [me["pos"][0] + 40, *me["pos"][1:]]}
+        bot.laser_unsafe = True
+        action = {}
+        with patch.object(bot.arena, "clear_shot", return_value=True):
+            bot.attack(me, target, action)
+            self.assertTrue(action["fire"][1])
+            me["aim"] = action["aim"]
+            laser["charge"] = stats["min_charge"]
+            bot.attack(me, target, action)
+            self.assertFalse(action["fire"][1])
 
     def test_empty_slot_accepts_mortar_and_open_circle_keeps_gun_with_laser(self):
         bot = Bot(self.hello)
@@ -278,7 +296,11 @@ class StrategyTests(unittest.TestCase):
         action = {}
         bot.loot(obs, [], action, opening=True)
         self.assertNotIn("take", action)
-        bot.loot(obs, [{"pos": [pos[0] + 45, pos[1], pos[2]]}], action)
+        bot.loot(obs, [{"pos": [pos[0] + 84, pos[1], pos[2]]}], action)
+        self.assertEqual((action["take"], action["drop"]), (201, 0))
+        obs["t"] = 66
+        action.clear()
+        bot.loot(obs, [], action)
         self.assertEqual((action["take"], action["drop"]), (201, 0))
 
     def test_execute_closes_range_but_checks_second_healthy_mech(self):
