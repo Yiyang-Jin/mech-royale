@@ -292,6 +292,28 @@ class StrategyTests(unittest.TestCase):
         self.assertLess(bot.kite_goal(me, target, PRACTICE)[0], 0)
         self.assertFalse(bot.can_execute(me, target, [target, {"id": 13, "pos": [90, 0, 0], "hp": 900}]))
 
+    def test_sound_selects_nearest_band_then_highest_threat_and_retains_bearing(self):
+        bot = Bot(self.hello)
+        obs = deepcopy(self.replay[0])
+        obs.update(mechs=[], sounds=[
+            {"kind": "laser_charge", "dist": "mid", "bearing": 1.1, "age": 0},
+            {"kind": "step", "dist": "near", "bearing": 0.2, "age": 0},
+            {"kind": "gun", "dist": "near", "bearing": -2, "age": 0.1},
+        ])
+        self.assertEqual(bot.act(obs)["aim"], [-2, 0])
+        obs.update(t=0.4, sounds=[])
+        self.assertEqual(bot.act(obs)["aim"], [-2, 0])
+        obs["t"] = 1
+        self.assertIsNone(bot.threat_sound(obs))
+
+    def test_upgrade_priority_prefers_armor_then_held_weapon_before_mobility(self):
+        bot = Bot(self.hello)
+        me = self.replay[0]["self"]
+        offer = {"choices": [{"id": key} for key in ("servos", "gun_damage", "armor")]}
+        self.assertEqual(bot.choose_upgrade(me, offer), 2)
+        offer["choices"].pop()
+        self.assertEqual(bot.choose_upgrade(me, offer), 1)
+
     def test_recorded_observations_without_wrapper_fallback(self):
         bot = Bot(self.hello)
         for obs in self.replay:

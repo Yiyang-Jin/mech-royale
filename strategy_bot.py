@@ -91,6 +91,8 @@ class Bot:
         self.laser_full_since = None
         self.laser_unsafe = False
         self.scan = hello["slot"] * math.tau / match["mechs"]
+        self.sound_bearing = None
+        self.sound_until = -math.inf
         self.scout_waypoint = None
         self.scout_until = -math.inf
         self.scout_turn = 0
@@ -620,6 +622,40 @@ class Bot:
             for enemy in enemies
         )
 
+    def threat_sound(self, obs):
+        now = obs["t"]
+        distance_order = {"near": 3, "mid": 2, "far": 1}
+        danger_order = {"laser_charge": 4, "gun": 3, "boost": 2, "step": 1}
+        candidates = [s for s in obs["sounds"] if s["kind"] in danger_order and s["age"] <= 0.6
+                      and (s["dist"] == "near" or s["kind"] in ("gun", "laser_charge"))]
+        if candidates:
+            sound = max(candidates, key=lambda s: (distance_order.get(s["dist"], 0),
+                                                   danger_order[s["kind"]], -s["age"]))
+            self.sound_bearing = sound["bearing"]
+            self.sound_until = now + 0.65 - sound["age"]
+        return self.sound_bearing if now <= self.sound_until else None
+
+    def choose_upgrade(self, me, offer):
+        held = {weapon["kind"] for weapon in me["weapons"] if weapon}
+
+        def priority(choice):
+            key = choice["id"]
+            if key == "armor":
+                return 100
+            kind = key.split("_", 1)[0]
+            if kind in ("laser", "gun") and kind in held:
+                return 65 if kind == "laser" else 60
+            if key in ("servos", "reactor", "jets", "capacitor"):
+                return 45
+            if key in ("nanites", "plating"):
+                return 35
+            if key == "sensors":
+                return 20
+            return 0
+
+        choices = offer["choices"]
+        return max(range(len(choices)), key=lambda index: priority(choices[index]))
+
     def scout_goal(self, obs):
         pos = obs["self"]["pos"]
         now = obs["t"]
@@ -683,11 +719,7 @@ class Bot:
         opening = (now < 70 and (None in me["weapons"] or me["cubes"] < 5)
                    and near_dist > 55 and not disengage)
         if obs["offer"]:
-            order = ("armor", "nanites", "servos", "plating", "reactor", "jets", "sensors",
-                     "gun_mag", "laser_charge", "gun_damage", "lightning_range")
-            ranks = {key: len(order) - i for i, key in enumerate(order)}
-            action["pick"] = max(range(len(obs["offer"]["choices"])),
-                                 key=lambda i: ranks.get(obs["offer"]["choices"][i]["id"], 0))
+            action["pick"] = self.choose_upgrade(me, obs["offer"])
         loot = self.loot(obs, enemies, action, opening)
         zone = obs["zone"]
         zone_goal = self.safe_destination(obs, pos[:2])
@@ -787,10 +819,12 @@ class Bot:
 
         if threat_bearing is None:
             self.scan = math.remainder(self.scan + 0.055, math.tau)
-            sounds = [s for s in obs["sounds"] if s["dist"] == "near"
-                      and s["kind"] in ("gun", "laser_charge", "lightning", "boost")]
-            look = sounds[0]["bearing"] if sounds else self.scan
+            sound = self.threat_sound(obs)
+            look = self.scan if sound is None else sound
+            if sound is not None:
+                target = None
         else:
+            self.sound_until = -math.inf
             look = threat_bearing
         action["aim"] = [look, 0.0]
         self.attack(me, target, action)
