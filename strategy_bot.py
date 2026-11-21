@@ -46,7 +46,6 @@ class Peek:
 
 
 PRACTICE = Tactics(0.56, 0.88, 72, 115, 82, 29)
-FREE_FOR_ALL = Tactics(0.66, 0.88, 88, 135, 98, 32)
 
 
 def angle_error(goal, current):
@@ -81,22 +80,18 @@ def intercept(offset, velocity, speed, barrel=0):
 class Bot:
     name = "mech-royale"
 
-    def __init__(self, hello: mf.Hello, practice=PRACTICE, free_for_all=FREE_FOR_ALL):
+    def __init__(self, hello: mf.Hello, practice=PRACTICE):
         self.config = hello["config"]
         self.arena = Arena(hello["map"]["dir"])
-        self.practice, self.free_for_all = practice, free_for_all
+        self.practice = practice
+        self.wave_probe = False
         match = self.config["match"]
         self.physics_step = 1 / match["tick_hz"]
         self.turn_step = match["decide_every"] * self.physics_step
-        self.alive = match["mechs"]
-        self.starting_alive = self.alive
-        self.first_shrink = self.config["zone"]["phases"][0]["hold_s"]
         self.kills = set()
-        self.other_fight_until = {}
         self.last_combat = -math.inf
         self.last_damage_bearing = None
         self.last_damage = -math.inf
-        self.pvp = False
         self.recovering = False
         self.uncovered_since = None
         self.frame_time = 0.0
@@ -121,7 +116,7 @@ class Bot:
         self.roof_deadline = -math.inf
         self.roof_retry = -math.inf
 
-    def update_situation(self, obs, enemies):
+    def update_situation(self, obs):
         now = obs["t"]
         for event in obs["events"]:
             kind = event["type"]
@@ -134,29 +129,17 @@ class Bot:
             if kind == "damaged" and event["bearing"] is not None:
                 self.last_damage_bearing = event["bearing"]
                 self.last_damage = now
-        # Zone deaths can also happen in practice, so use early deaths only.
-        if (obs["alive"] < self.alive and now < self.first_shrink
-                and self.starting_alive - obs["alive"] > len(self.kills)):
-            self.pvp = True
-        self.alive = obs["alive"]
-        own = obs["self"]["pos"]
-        for beam in obs["beams"]:
-            source = beam["by"]
-            for point in beam["path"][1:]:
-                # A beam ending near us is ambiguous even when another mech is nearby.
-                if distance(point, own) < obs["self"]["stats"]["radius"] + 6:
-                    continue
-                for enemy in enemies:
-                    if enemy["id"] == source:
-                        continue
-                    pos = enemy["pos"]
-                    size = 1 + self.config["cubes"]["size_per_cube"] * enemy.get("cubes", 0)
-                    stats = self.config["mech"]
-                    if (distance(point, pos) <= stats["radius"] * size + 1
-                            and pos[2] - 1 <= point[2] <= pos[2] + stats["height"] * size + 1):
-                        self.pvp = True
-                        self.other_fight_until[enemy["id"]] = now + 3
-                        self.other_fight_until[source] = now + 3
+
+    def spare_pursuer(self, me, enemies, now):
+        if not self.wave_probe or self.kills or now >= 90 or len(enemies) != 1:
+            return None
+        has_laser = any(weapon and weapon["kind"] == "laser" for weapon in me["weapons"])
+        if has_laser and me["cubes"] >= 8:
+            return None
+        enemy, = enemies
+        if enemy.get("hp", math.inf) < 350 and distance(me["pos"], enemy["pos"]) > 45:
+            return enemy
+        return None
 
     def aim(self, me, target, weapon, check_path=True):
         kind, stats = weapon["kind"], weapon["stats"]
@@ -1017,9 +1000,9 @@ class Bot:
         self.peek_precharge = False
         enemies = sorted((a for a in obs["mechs"] if a["kind"] == "mech"),
                          key=lambda a: distance(pos, a["pos"]))
-        self.update_situation(obs, enemies)
+        self.update_situation(obs)
         hp = me["hp"] / me["max_hp"]
-        tactics = self.free_for_all if self.pvp else self.practice
+        tactics = self.practice
         if hp < tactics.retreat_hp:
             self.recovering = True
         if hp >= tactics.recover_hp:
@@ -1036,11 +1019,8 @@ class Bot:
         active_enemies = [e for e in enemies if distance(pos, e["pos"]) < 115]
         outnumbered = len(active_enemies) >= 3 and near_dist > 22
         disengage = self.recovering or outnumbered
-        candidates = [e for e in enemies if not self.pvp or distance(pos, e["pos"]) < 40
-            or (recently_hit and abs(angle_error(bearing(pos, e["pos"]), self.last_damage_bearing)) < 0.5)
-            or e.get("hp", math.inf) < 0.26 * e.get("max_hp", 1400)
-            or self.other_fight_until.get(e["id"], -1) > now]
-        target = self.select_target(me, candidates)
+        spared = self.spare_pursuer(me, enemies, now)
+        target = None if spared is not None else self.select_target(me, enemies)
         recover_covered = (self.recovering and me["grounded"] and not recently_hit
                            and self.covered_for_recovery(me, enemies, tactics))
         if recover_covered:
@@ -1060,8 +1040,8 @@ class Bot:
                             self.mech_point(target, self.config["mech"]["height"] / 2)))
 
         action: mf.Action = {"tick": obs["tick"]}
-        opening = (now < 70 and (None in me["weapons"] or me["cubes"] < 5)
-                   and near_dist > 55 and not disengage)
+        opening = not disengage and (spared is not None or (
+            now < 70 and (None in me["weapons"] or me["cubes"] < 5) and near_dist > 55))
         if obs["offer"]:
             action["pick"] = self.choose_upgrade(me, obs["offer"])
         loot = self.loot(obs, enemies, action, opening)
@@ -1075,7 +1055,6 @@ class Bot:
         )
 
         goal = zone_goal
-        quiet = False
         developing = False
         peek_plan = None
         corner = None
@@ -1087,7 +1066,7 @@ class Bot:
                       and abs(cube["pos"][2] - pos[2]) <= 4]
         if not urgent_zone:
             resources = None
-            if not opening and not self.pvp and not disengage and not recently_hit and near_dist > 42:
+            if not opening and not disengage and not recently_hit and near_dist > 42:
                 resources = self.resource_goal(obs, loot, enemies)
             if recovery_stalled and near_dist > 45 and threat_bearing is not None and me["grounded"]:
                 recovery_route = self.recovery_cover(obs, enemies, threat_bearing + math.pi)
@@ -1127,10 +1106,8 @@ class Bot:
                 goal = self.kite_goal(me, target, tactics, now, zone["radius"], execute=True)
             elif kill_cubes:
                 goal = min(kill_cubes, key=lambda cube: distance(pos, cube["pos"]))["pos"][:2]
-            elif threat_bearing is not None and (
-                (disengage and not (recovery_stalled and target is not None))
-                or (not opening and self.pvp and target is None and near_dist < 70)
-            ):
+            elif (threat_bearing is not None and disengage
+                  and not (recovery_stalled and target is not None)):
                 away = threat_bearing + math.pi + 0.33 * self.weave_side(now)
                 goal = (pos[0] + 40 * math.cos(away), pos[1] + 40 * math.sin(away))
                 goal = self.orbit_goal(obs, goal, enemies, threat_bearing)
@@ -1161,20 +1138,13 @@ class Bot:
                     if math.cos(angle_error(bearing(pos, goal), facing)) < -1e-6:
                         goal = self.orbit_goal(obs, goal, enemies, facing)
             elif not disengage:
-                cubes = [c for c in obs["cubes"] if abs(c["pos"][2] - pos[2]) < 4]
-                cap = self.config["cubes"]["stat_cap"] if not self.pvp else 6
-                if self.pvp and cubes and me["cubes"] < cap and not active_enemies:
-                    goal = min(cubes, key=lambda c: distance(pos, c["pos"]))["pos"][:2]
-                elif self.pvp and None in me["weapons"] and loot and not active_enemies:
-                    goal = min(loot, key=lambda p: distance(pos, p["pos"]))["pos"][:2]
-                elif not enemies and me["cubes"] < cap and not recently_hit:
+                cap = self.config["cubes"]["stat_cap"]
+                if not enemies and me["cubes"] < cap and not recently_hit:
                     farm = [a for a in (*obs["crates"], *obs["mechs"])
-                            if a.get("kind") != "mech" and distance(pos, a["pos"]) < (60 if self.pvp else 120)]
+                            if a.get("kind") != "mech" and distance(pos, a["pos"]) < 120]
                     target = min(farm, key=lambda a: distance(pos, a["pos"]), default=None)
                     if target is not None and distance(pos, target["pos"]) > 28:
                         goal = target["pos"][:2]
-                elif self.pvp and near_dist > 70:
-                    quiet = True
         if (not urgent_zone and not disengage and supply is None and not execute
                 and peek_plan is None and corner is None):
             single_gun = len([w for w in me["weapons"] if w and w["kind"] == "gun"]) == 1 and None in me["weapons"]
@@ -1197,7 +1167,7 @@ class Bot:
                     target = farm
                 if cube is not None:
                     goal = cube[:2]
-        if distance(pos, goal) < 2 and target is None and not disengage and not self.pvp and supply is None:
+        if distance(pos, goal) < 2 and target is None and not disengage and supply is None:
             goal = self.scout_goal(obs)
         if peek_plan is None:
             self.peek = None
@@ -1219,7 +1189,7 @@ class Bot:
         escaping = disengage and not (peek_plan or corner or fight_close
                                        or (recovery_stalled and target is not None and recovery_route is None))
         self.move(me, goal, action, dodge, urgent_zone or (escaping and near_dist < 95),
-                  quiet and dodge is None and not urgent_zone, cover_from if escaping else None)
+                  False, cover_from if escaping else None)
         boost_route = ((developing and distance(pos, goal) > 9)
                        or (execute and not urgent_zone and distance(pos, target["pos"]) > 50)
                        or (supply is not None and supply[1] is None and distance(pos, goal) > 24))
@@ -1240,6 +1210,9 @@ class Bot:
             self.sound_until = -math.inf
             look = threat_bearing
         action["aim"] = list(peek_plan[1]) if peek_plan else [look, 0.0]
+
+        if spared is not None and target is not None and target["id"] == spared["id"]:
+            target = None
         self.attack(me, target, action)
         if (escaping or urgent_zone) and threat_bearing is not None:
             shooter = next((e for e in enemies if e.get("charging") and distance(pos, e["pos"]) <= 200), None)
@@ -1253,10 +1226,16 @@ class Bot:
         gun = next((w for w in me["weapons"] if w and w["kind"] == "gun"), None)
         if gun and not gun["reload"] and gun["ammo"] < gun["stats"]["mag"]:
             action["reload"] = gun["ammo"] == 0 or (target is None and (near_dist > 65 or disengage))
-        mode = "FFA" if self.pvp else "practice"
+        if spared is not None:
+            for slot, weapon in enumerate(me["weapons"]):
+                if (weapon and weapon["kind"] == "laser" and weapon.get("charge", 0) > 0
+                        and self.laser_ray_hits(me, spared, weapon)):
+                    action["aim"] = [bearing(pos, spared["pos"]) + math.pi / 2, 0.0]
+                    action["fire"] = [index == slot for index in range(2)]
+                    break
         recovering = self.recovering and now - self.last_combat >= me["stats"]["regen_delay"]
         state = "healing" if recovering else "retreat" if escaping else "active"
-        mf.draw.label(f"{mode} | {state}")
+        mf.draw.label(f"practice | {state}")
         return action
 
 

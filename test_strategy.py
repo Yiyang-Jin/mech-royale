@@ -34,15 +34,19 @@ class StrategyTests(unittest.TestCase):
         self.assertAlmostEqual(intercept((100, 0, 0), (10, 0, 0), 100, 4), 96 / 90)
         self.assertIsNone(intercept((100, 0, 0), (110, 0, 0), 100))
 
-    def test_only_unexplained_early_death_changes_mode(self):
+    def test_wave_probe_spares_only_the_opening_pursuer(self):
         bot = Bot(self.hello)
-        obs = deepcopy(self.replay[0])
-        obs.update(alive=15, t=10, events=[{"type": "kill", "target": 8}], beams=[])
-        bot.update_situation(obs, [])
-        self.assertFalse(bot.pvp)
-        obs.update(alive=14, t=20, events=[])
-        bot.update_situation(obs, [])
-        self.assertTrue(bot.pvp)
+        bot.wave_probe = True
+        me = {"pos": (0, 0, 0), "weapons": [{"kind": "gun"}, {"kind": "laser"}], "cubes": 7}
+        enemy = {"id": 8, "pos": (46, 0, 0), "hp": 349}
+        self.assertIs(bot.spare_pursuer(me, [enemy], 89.9), enemy)
+        self.assertIsNone(bot.spare_pursuer(me, [enemy], 90))
+        self.assertIsNone(bot.spare_pursuer(me, [enemy, enemy], 50))
+        self.assertIsNone(bot.spare_pursuer(me, [dict(enemy, hp=350)], 50))
+        self.assertIsNone(bot.spare_pursuer(me, [dict(enemy, pos=(45, 0, 0))], 50))
+        self.assertIsNone(bot.spare_pursuer(dict(me, cubes=8), [enemy], 50))
+        bot.update_situation({"t": 10, "events": [{"type": "kill", "target": 9}]})
+        self.assertIsNone(bot.spare_pursuer(me, [enemy], 50))
 
     def test_early_bullet_cpa_and_mortar_landing_priority(self):
         bot = Bot(self.hello)

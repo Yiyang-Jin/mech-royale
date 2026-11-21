@@ -16,5 +16,11 @@ class CloseFightProbe(GroundCanary):
         return super().kite_goal(me, target, tactics, now, zone_radius, execute)
 
 
+class WaveProbe(CloseFightProbe):
+    def __init__(self, hello):
+        super().__init__(hello)
+        self.wave_probe = True
+
+
 if __name__ == "__main__":
-    run(CloseFightProbe)
+    run(WaveProbe)

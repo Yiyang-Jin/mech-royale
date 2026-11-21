@@ -1,6 +1,5 @@
-# Build from this folder: docker build -t my-bot .
-# The match runs it with no network, a read-only root (writable /tmp), 1 CPU, 512 MB, and the map at /arena.
+# The practice runner mounts the map at /arena.
 FROM python:3.13-slim
 WORKDIR /bot
-COPY . .
-ENTRYPOINT ["python3", "-u", "/bot/probe_bot.py"]
+COPY mechfight.py arena_geometry.py canary_path.py canary_bot.py strategy_bot.py probe_bot.py ./
+ENTRYPOINT ["python3", "-u", "-m", "probe_bot"]
