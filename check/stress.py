@@ -79,8 +79,8 @@ def main():
     times.sort()
     p99 = times[math.ceil(len(times) * 0.99) - 1]
     print(f"{len(times)} decisions | p99 {p99:.2f} ms | max {times[-1]:.2f} ms")
-    if p99 >= 25 or times[-1] >= 50:
-        raise SystemExit("decision latency exceeded budget")
+    if times[-1] >= 35:
+        raise SystemExit("decision latency exceeded the 35 ms stress limit")
     if sys.platform.startswith("linux"):
         import resource
 

@@ -10,7 +10,8 @@ from unittest.mock import patch
 from types import SimpleNamespace
 
 from arena_geometry import Arena, Prism
-from ground_navigation import Crossing, Influence, NavGraph, jet_energy
+from ground_navigation import (ALLOW_UPWARD_PORTALS, TACTICAL_NODE_LIMIT, TACTICAL_RADIUS,
+                               Crossing, Influence, NavGraph, jet_energy)
 from strategy_bot import Bot, PRACTICE, intercept
 
 
@@ -265,7 +266,7 @@ class StrategyTests(unittest.TestCase):
             enemies=[(-55, 0, 0, 25, None, 8)],
             zone=obs["zone"],
             risk=lambda point: 0,
-            exposure=lambda point, height, target: (int(point[0] == 0), False),
+            exposed=lambda point, height: point[0] == 0,
         )
         cost = {0: 0, 1: 6, 2: 17}
         nav.destination = 1
@@ -289,9 +290,42 @@ class StrategyTests(unittest.TestCase):
         self.assertEqual(route[0], start)
         self.assertTrue(all(field.risk(graph.xyz[node]) == 0 for node in route))
         expanded = choose.call_args.args[0]
-        self.assertLessEqual(len(expanded), 720)
-        self.assertTrue(all((graph.xyz[node][0] + 12)**2 + graph.xyz[node][1]**2 <= 70**2
+        self.assertLessEqual(len(expanded), TACTICAL_NODE_LIMIT)
+        self.assertTrue(any((graph.xyz[node][0] + 12)**2 + graph.xyz[node][1]**2 > 70**2
                             for node in expanded))
+        self.assertTrue(all((graph.xyz[node][0] + 12)**2 + graph.xyz[node][1]**2 <= TACTICAL_RADIUS**2
+                            for node in expanded))
+
+    def test_retreat_replans_immediately_when_shelter_becomes_exposed(self):
+        bot = self.make_bot()
+        nav = bot.navigation
+        obs = deepcopy(self.replay[0])
+        obs["t"] = 1
+        node = nav.graph.nearest(obs["self"]["pos"])
+        nav.plan_key, nav.plan_at = ("retreat", None), 1.5
+        nav.destination, nav.shelter_clear = node, True
+        with (patch.object(Influence, "exposed", return_value=True),
+              patch.object(nav, "emergency_direction", return_value=None),
+              patch.object(nav, "reachable", return_value=True),
+              patch.object(nav, "search", return_value=(deque([node]), node)) as search):
+            nav.control(obs, [], tuple(obs["self"]["pos"][:2]), "retreat", recently_hit=True)
+            search.assert_called_once()
+            self.assertFalse(nav.shelter_clear)
+
+    def test_climb_requires_retreat_or_multiple_pursuers(self):
+        bot = self.make_bot()
+        obs = deepcopy(self.replay[0])
+        x, y, z = obs["self"]["pos"]
+        watcher = {"id": 12, "kind": "mech", "weapons": ["laser"], "hp": 1400, "max_hp": 1400,
+                   "pos": [x - 20, y, z], "aim": [0, 0]}
+        obs["mechs"] = [watcher]
+        self.assertFalse(bot.navigation.may_climb(obs, "retreat"))
+        self.assertFalse(bot.navigation.may_climb(obs, "kite"))
+        watcher["aim"][0] = math.pi
+        self.assertEqual(bot.navigation.may_climb(obs, "retreat"), ALLOW_UPWARD_PORTALS)
+        obs["mechs"].append({"id": 13, "kind": "mech", "pos": [x + 33, y, z]})
+        self.assertEqual(bot.navigation.may_climb(obs, "kite"), ALLOW_UPWARD_PORTALS)
+        self.assertFalse(bot.navigation.may_climb(obs, "travel"))
 
     def test_graph_contains_roofs_and_directed_climb_and_drop_edges(self):
         graph = self.graph

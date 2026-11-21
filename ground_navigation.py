@@ -8,6 +8,10 @@ from time import perf_counter
 
 STEP = 4
 DIRECTIONS = ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1))
+TACTICAL_RADIUS = 95
+TACTICAL_NODE_LIMIT = 1800
+TRAVEL_NODE_LIMIT = 5000
+ALLOW_UPWARD_PORTALS = True
 
 
 def gap(a, b):
@@ -258,8 +262,9 @@ class Influence:
         danger = self.zone_cost(point)
         for ex, ey, muzzle, reach, laser, _ in self.enemies:
             dx, dy = x - ex, y - ey
-            separation = math.hypot(dx, dy)
-            danger += 5 * max(0, 1 - separation / reach)
+            separation_squared = dx * dx + dy * dy
+            if separation_squared < reach * reach:
+                danger += 5 * (1 - math.sqrt(separation_squared) / reach)
             if laser is not None:
                 ax, ay, slope = laser
                 along = dx * ax + dy * ay
@@ -282,6 +287,11 @@ class Influence:
                 other_count += 1
         return other_count, sees_target
 
+    def exposed(self, point, own_height):
+        x, y, z = point
+        return any(self.arena.clear_shot((ex, ey, muzzle), (x, y, z + own_height))
+                   for ex, ey, muzzle, _, _, _ in self.enemies)
+
 
 @dataclass
 class Crossing:
@@ -300,6 +310,7 @@ class Navigation:
         self.graph = NavGraph(arena, config["mech"])
         self.path = deque()
         self.destination = None
+        self.shelter_clear = False
         self.plan_key = None
         self.plan_at = 0.0
         self.crossing = None
@@ -310,7 +321,8 @@ class Navigation:
     def search(self, start, obs, influence, mode, goal, target, ideal):
         graph, me = self.graph, obs["self"]
         travel = mode == "travel"
-        deadline = perf_counter() + 0.014
+        started = perf_counter()
+        deadline = started + 0.022
         queue = [(0.0, 0.0, start)]
         reached = {start: 0.0}
         used_energy = {start: 0.0}
@@ -318,9 +330,11 @@ class Navigation:
         risk = {}
         settled = []
         closest = start
-        for_count = 1400 if travel else 720
+        for_count = TRAVEL_NODE_LIMIT if travel else TACTICAL_NODE_LIMIT
+        origin_x, origin_y = me["pos"][:2]
+        allow_up = self.may_climb(obs, mode)
         while queue and len(settled) < for_count:
-            if len(settled) % 32 == 0 and perf_counter() >= deadline:
+            if len(settled) % 16 == 0 and perf_counter() >= deadline:
                 break
             _, walked, node = heappop(queue)
             if walked != reached[node]:
@@ -333,7 +347,7 @@ class Navigation:
                     break
             for other, weight in graph.edges[node]:
                 point = graph.xyz[other]
-                if not travel and gap(me["pos"], point) > 70:
+                if not travel and (point[0] - origin_x)**2 + (point[1] - origin_y)**2 > TACTICAL_RADIUS**2:
                     continue
                 energy = used_energy[node]
                 portal = graph.portals.get((node, other))
@@ -341,11 +355,13 @@ class Navigation:
                     if self.banned.get(portal, -math.inf) > obs["t"]:
                         continue
                     if other >= graph.count:
-                        if travel:
+                        if not allow_up:
                             continue
                         energy += jet_energy(portal, me["stats"])
                         if me["energy"] < energy + 15:
                             continue
+                        if mode == "kite":
+                            weight += 25
                 if other not in risk:
                     risk[other] = influence.risk(point)
                 new_cost = walked + weight * (1 + risk[other])
@@ -355,20 +371,43 @@ class Navigation:
                     heappush(queue, (new_cost + heuristic, new_cost, other))
 
         if not travel and settled:
-            closest = self.choose(settled, reached, start, obs, influence, mode, target, ideal, risk)
+            closest = self.choose(settled, reached, start, obs, influence, mode, target, ideal, risk,
+                                  deadline=started + 0.028)
         path = deque([closest])
         while path[0] in previous:
             path.appendleft(previous[path[0]])
         return path, closest
 
-    def choose(self, nodes, cost, start, obs, influence, mode, target, ideal, risk):
+    def may_climb(self, obs, mode):
+        if not ALLOW_UPWARD_PORTALS or mode not in ("kite", "retreat"):
+            return False
+        pos = obs["self"]["pos"]
+        pursuers = 0
+        watched = False
+        for enemy in obs["mechs"]:
+            if enemy["kind"] != "mech":
+                continue
+            d = gap(pos, enemy["pos"])
+            pursuers += d < 85
+            if d >= 25 or "laser" not in enemy.get("weapons", ()):
+                continue
+            if enemy.get("hp", math.inf) < 0.9 * enemy.get("max_hp", math.inf):
+                continue
+            yaw = math.atan2(pos[1] - enemy["pos"][1], pos[0] - enemy["pos"][0])
+            watched |= abs(math.remainder(yaw - enemy["aim"][0], math.tau)) <= 0.45
+        return pursuers >= 2 or (mode == "retreat" and not watched)
+
+    def choose(self, nodes, cost, start, obs, influence, mode, target, ideal, risk, deadline=None):
         graph = self.graph
         me = obs["self"]
         center_height = me["stats"]["height"] / 2
         target_id = target["id"] if target else None
         ranked = {}
         scores = {}
-        for node in nodes:
+        score_until = deadline - 0.003 if deadline is not None else math.inf
+        for index, node in enumerate(nodes):
+            if index and index % 32 == 0 and perf_counter() >= score_until:
+                break
             x, y, z = graph.xyz[node]
             if node != start and me["in_zone"] and gap((x, y), influence.zone["center"]) > influence.zone["radius"]:
                 continue
@@ -394,19 +433,19 @@ class Navigation:
         required = {start, self.destination} & scores.keys()
         required.difference_update(node for _, node in candidates)
         candidates[:0] = [(scores[node], node) for node in sorted(required)]
-        deadline = perf_counter() + 0.006
+        sight_deadline = min(deadline or math.inf, perf_counter() + 0.006)
         best = (-math.inf, start)
         for score, node in candidates:
-            others, visible = influence.exposure(graph.xyz[node], center_height, target_id)
             if mode == "retreat":
-                score -= 1000 if others else 0
-                score -= 16 * others
+                if influence.exposed(graph.xyz[node], center_height):
+                    score -= 1000
             else:
+                others, visible = influence.exposure(graph.xyz[node], center_height, target_id)
                 score += 33 if visible else -28
                 score -= 24 * others
             if score > best[0]:
                 best = score, node
-            if perf_counter() >= deadline:
+            if perf_counter() >= sight_deadline:
                 break
         return best[1]
 
@@ -604,8 +643,9 @@ class Navigation:
         pos = me["pos"]
         influence = Influence(self.arena, self.config, obs, enemies)
         if self.crossing is not None:
-            action = (None if urgent and self.crossing.up and self.crossing.jumped_at is None
-                      else self.traverse(obs, self.crossing))
+            cancel = (self.crossing.up and self.crossing.jumped_at is None
+                      and (urgent or not self.may_climb(obs, mode)))
+            action = None if cancel else self.traverse(obs, self.crossing)
             if action is not None:
                 return action, True
             self.crossing = None
@@ -625,13 +665,23 @@ class Navigation:
             count, _ = influence.exposure(pos, me["stats"]["height"] / 2)
             if count == 0:
                 self.path.clear()
+                self.destination = None
+                self.shelter_clear = False
+                self.plan_at = 0
                 return {}, False
         key = (mode, target["id"] if target else None)
         if key != self.plan_key:
             self.plan_key = key
             self.path.clear()
             self.destination = None
+            self.shelter_clear = False
             self.plan_at = 0
+        center_height = me["stats"]["height"] / 2
+        if mode == "retreat" and self.destination is not None:
+            covered = not influence.exposed(self.graph.xyz[self.destination], center_height)
+            if self.shelter_clear and not covered:
+                self.plan_at = 0
+            self.shelter_clear = covered
         lost = self.path and gap(pos, self.graph.xyz[self.path[0]]) > 19
         if me["grounded"] and (now >= self.plan_at or lost):
             self.plan_at = now + (0.55 if mode != "travel" else 0.8)
@@ -639,11 +689,17 @@ class Navigation:
             if start is not None:
                 new_path, self.destination = self.search(start, obs, influence, mode, goal, target, ideal)
                 self.path = new_path
+                if mode == "retreat":
+                    self.shelter_clear = not influence.exposed(self.graph.xyz[self.destination], center_height)
         while len(self.path) >= 2:
             here, following = self.path[0], self.path[1]
             here_pos = self.graph.xyz[here]
             portal = self.graph.portals.get((here, following))
             if portal is not None:
+                if here == portal.ground and not self.may_climb(obs, mode):
+                    self.path.clear()
+                    self.plan_at = 0
+                    break
                 arrival = 2.2 if here == portal.ground else 1.25
                 if gap(pos, here_pos) > arrival:
                     break
@@ -672,9 +728,13 @@ class Navigation:
             if mode == "travel" and len(self.path) == 1 and gap(point, goal) < 5 and self.reachable(me, goal):
                 point = goal
             elif mode == "retreat" and point == self.graph.xyz[self.path[-1]] and gap(pos, point) < 8:
-                stop_at_shelter = influence.exposure(point, me["stats"]["height"] / 2)[0] == 0
+                stop_at_shelter = self.shelter_clear
         else:
             point = goal
+        if mode == "retreat" and not stop_at_shelter and gap(pos, point) < 2.4 and enemies:
+            tx, ty, _ = enemies[0]["pos"]
+            away = math.atan2(pos[1] - ty, pos[0] - tx)
+            point = (pos[0] + 8 * math.cos(away), pos[1] + 8 * math.sin(away))
         sprint = urgent or (mode == "retreat" and near < 90)
         return self.drive(me, point, sprint=sprint, emergency=near < 20, stop=stop_at_shelter), False
 
