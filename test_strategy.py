@@ -95,7 +95,8 @@ class StrategyTests(unittest.TestCase):
         me["weapons"][1] = {"kind": "laser", "stats": laser, "cooldown": 0, "charge": laser["charge"]}
         me["aim"] = [0, 0]
         action = {}
-        with patch.object(bot, "aim", return_value=(0, 0, 0.04, 0.08)):
+        with (patch.object(bot, "aim", return_value=(0, 0, 0.04, 0.08)),
+              patch.object(bot, "laser_ray_hits", return_value=True)):
             bot.attack(me, {}, action)
         self.assertEqual(action["fire"], [True, False])
 
@@ -144,7 +145,7 @@ class StrategyTests(unittest.TestCase):
         x, y, z = me["pos"]
         laser = {"id": 8000, "kind": "laser", "pos": [x, y + 58, z]}
         lightning = {"id": 8001, "kind": "lightning", "pos": [x, y + 29, z]}
-        crate = {"id": 1000, "pos": [x, y + 24, z], "hp": 300}
+        crate = {"id": 1000, "pos": [x, y + 24, z], "hp": 125}
         enemy = {"id": 12, "kind": "mech", "pos": [x + 66, y, z], "aim": [0, 0]}
         obs.update(t=10, pickups=[lightning, laser], crates=[crate],
                    mechs=[enemy], sounds=[], projectiles=[])
@@ -156,6 +157,9 @@ class StrategyTests(unittest.TestCase):
             self.assertEqual(move.call_args.args[1], tuple(laser["pos"][:2]))
             self.assertEqual(attack.call_args.args[1], crate)
             self.assertTrue(action["boost"])
+            crate["hp"] = 300
+            bot.act(obs)
+            self.assertEqual(attack.call_args.args[1], enemy)
             enemy["pos"] = [x + 50, y, z]
             bot.act(obs)
             self.assertEqual(attack.call_args.args[1], enemy)
@@ -168,7 +172,8 @@ class StrategyTests(unittest.TestCase):
         self.assertLess(bot.kite_goal(me, charged_enemy, PRACTICE)[0], 0)
         weapons = self.hello["config"]["weapons"]
         me["weapons"] = [{"kind": k, "stats": weapons[k]} for k in ("laser", "lightning")]
-        self.assertLess(bot.kite_goal(me, {"pos": [130, 0, 0]}, PRACTICE)[0], 0)
+        self.assertLess(bot.kite_goal(me, {"pos": [105, 0, 0]}, PRACTICE)[0], 0)
+        self.assertGreater(bot.kite_goal(me, {"pos": [135, 0, 0]}, PRACTICE)[0], 0)
         self.assertGreater(bot.kite_goal(me, {"pos": [175, 0, 0]}, PRACTICE)[0], 0)
         self.assertEqual(max(bot.weapon_order(90), key=bot.weapon_order(90).get), "lightning")
 
@@ -235,8 +240,57 @@ class StrategyTests(unittest.TestCase):
         obs["mechs"] = [{"id": 12, "kind": "mech", "pos": [x - 9, y, z], "aim": [0, 0]}]
         with (patch.object(bot.arena, "clear_shot", return_value=False),
               patch.object(bot, "attack", wraps=bot.attack) as attack):
-            bot.act(obs)
-        self.assertIsNone(attack.call_args.args[1])
+            action = bot.act(obs)
+        self.assertIsNotNone(attack.call_args.args[1])
+        self.assertEqual(action["fire"], [False, False])
+
+    def test_full_laser_waits_for_visible_ray_but_releases_after_grace_or_near_lightning(self):
+        bot = Bot(self.hello)
+        me = deepcopy(self.replay[0]["self"])
+        laser = self.hello["config"]["weapons"]["laser"]
+        me["weapons"] = [None, {"kind": "laser", "stats": laser, "cooldown": 0, "charge": laser["charge"]}]
+        action = {}
+        with (patch.object(bot, "laser_ray_hits", return_value=False),
+              patch.object(bot, "aim", return_value=None)):
+            bot.frame_time = 10
+            bot.attack(me, {}, action)
+            self.assertEqual(action["fire"], [False, True])
+            bot.frame_time = 11.8
+            bot.attack(me, {}, action)
+            self.assertEqual(action["fire"], [False, False])
+            bot.frame_time = 10.5
+            bot.laser_unsafe = True
+            bot.attack(me, {}, action)
+            self.assertEqual(action["fire"], [False, False])
+
+    def test_empty_slot_accepts_mortar_and_open_circle_keeps_gun_with_laser(self):
+        bot = Bot(self.hello)
+        obs = deepcopy(self.replay[0])
+        me = obs["self"]
+        pos = me["pos"]
+        obs["pickups"] = [{"id": 200, "kind": "mortar", "pos": pos}]
+        action = {}
+        bot.loot(obs, [], action, opening=True)
+        self.assertEqual(action["take"], 200)
+        me["weapons"][1] = {"kind": "laser"}
+        obs["pickups"] = [{"id": 201, "kind": "lightning", "pos": pos}]
+        action = {}
+        bot.loot(obs, [], action, opening=True)
+        self.assertNotIn("take", action)
+        bot.loot(obs, [{"pos": [pos[0] + 45, pos[1], pos[2]]}], action)
+        self.assertEqual((action["take"], action["drop"]), (201, 0))
+
+    def test_execute_closes_range_but_checks_second_healthy_mech(self):
+        bot = Bot(self.hello)
+        me = deepcopy(self.replay[0]["self"])
+        me["pos"] = [0, 0, 0]
+        weapon = self.hello["config"]["weapons"]["laser"]
+        me["weapons"][1] = {"kind": "laser", "stats": weapon}
+        target = {"id": 12, "kind": "mech", "pos": [70, 0, 0], "hp": 500}
+        self.assertTrue(bot.can_execute(me, target, [target]))
+        self.assertGreater(bot.kite_goal(me, target, PRACTICE, execute=True)[0], 0)
+        self.assertLess(bot.kite_goal(me, target, PRACTICE)[0], 0)
+        self.assertFalse(bot.can_execute(me, target, [target, {"id": 13, "pos": [90, 0, 0], "hp": 900}]))
 
     def test_recorded_observations_without_wrapper_fallback(self):
         bot = Bot(self.hello)
