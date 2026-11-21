@@ -98,6 +98,7 @@ class Bot:
         self.last_damage = -math.inf
         self.pvp = False
         self.recovering = False
+        self.uncovered_since = None
         self.frame_time = 0.0
         self.collect_until = -math.inf
         self.laser_full_since = None
@@ -780,7 +781,7 @@ class Bot:
         toward = bearing(me["pos"], target["pos"])
         deadline = perf_counter() + 0.012
         best = None
-        for gap in (5, 8, 12):
+        for gap in (12, 22, 32):
             for offset in (90, -90, 45, -45, 135, -135, 0, 180):
                 if perf_counter() >= deadline:
                     return best[1:] if best else None
@@ -802,6 +803,23 @@ class Bot:
             if best is not None:
                 break
         return best[1:] if best else None
+
+    def recovery_cover(self, obs, enemies, away):
+        me = obs["self"]
+        x, y, z = me["pos"]
+        for gap in (12, 22, 32):
+            for offset in (0, 40, -40, 80, -80, 120, -120):
+                yaw = away + self.turn_side * math.radians(offset)
+                point = (x + gap * math.cos(yaw), y + gap * math.sin(yaw))
+                height = self.arena.ground(*point)
+                if (distance(point, self.safe_destination(obs, point)) > 1
+                        or abs(height - z) > gap * math.tan(math.radians(me["stats"]["max_slope_deg"]))):
+                    continue
+                landing = dict(me, pos=(*point, height))
+                if (self.arena.walkable(landing, yaw, me["stats"]["radius"])
+                        and self.isolated(me, landing["pos"], enemies)):
+                    return point
+        return None
 
     def cover_peek(self, obs, target, others=(), corner=None):
         me, now = obs["self"], obs["t"]
@@ -922,7 +940,15 @@ class Bot:
                            and self.covered_for_recovery(me, enemies, tactics))
         if recover_covered:
             target = None
-        execute = not self.recovering and self.can_execute(me, target, enemies)
+        if not self.recovering or recover_covered:
+            self.uncovered_since = None
+        elif self.uncovered_since is None:
+            self.uncovered_since = now
+        recovery_stalled = self.uncovered_since is not None and now - self.uncovered_since >= 2.5
+        fight_close = recovery_stalled and near_dist <= 45
+        if fight_close and (target is None or distance(pos, target["pos"]) > 45):
+            target = self.select_target(me, [e for e in enemies if distance(pos, e["pos"]) <= 45])
+        execute = (not self.recovering or recovery_stalled) and self.can_execute(me, target, enemies)
         quick_finish = (execute and target.get("hp", math.inf) < 350
                         and distance(pos, target["pos"]) < 70 and self.arena.clear_shot(
                             (*pos[:2], pos[2] + me["stats"]["muzzle_height"]),
@@ -948,6 +974,7 @@ class Bot:
         developing = False
         peek_plan = None
         corner = None
+        recovery_route = None
         supply = None
         cube_reach = self.cube_reach(me, 42)
         kill_cubes = [cube for cube in obs["cubes"] if now < self.collect_until and near_dist >= 45
@@ -957,10 +984,13 @@ class Bot:
             resources = None
             if not opening and not self.pvp and not disengage and not recently_hit and near_dist > 42:
                 resources = self.resource_goal(obs, loot, enemies)
-            if not recover_covered and not quick_finish:
+            if recovery_stalled and near_dist > 45 and threat_bearing is not None and me["grounded"]:
+                recovery_route = self.recovery_cover(obs, enemies, threat_bearing + math.pi)
+            if not recover_covered and not quick_finish and not recovery_stalled:
                 supply = self.choose_supply(obs, enemies)
             others = [e for e in active_enemies if target is not None and e["id"] != target["id"]]
-            if (supply is None and not self.recovering and len(active_enemies) >= 2
+            if (supply is None and recovery_route is None and not fight_close
+                    and (not self.recovering or recovery_stalled) and len(active_enemies) >= 2
                     and target is not None and not quick_finish and not kill_cubes):
                 if me["grounded"] and (self.peek is None or self.peek.target != target["id"]):
                     weapon = next((w for kind in ("laser", "gun", "lightning", "mortar")
@@ -971,6 +1001,13 @@ class Bot:
                 peek_plan = self.cover_peek(obs, target, others, corner)
             if recover_covered:
                 goal = zone_goal
+            elif fight_close:
+                yaw = bearing(pos, target["pos"]) + self.weave_side(now) * math.pi / 2
+                goal = (pos[0] + 24 * math.cos(yaw), pos[1] + 24 * math.sin(yaw))
+                execute = False
+            elif recovery_route is not None:
+                goal = recovery_route
+                execute = False
             elif quick_finish:
                 goal = self.kite_goal(me, target, tactics, now, zone["radius"], execute=True)
             elif supply is not None:
@@ -986,7 +1023,8 @@ class Bot:
             elif kill_cubes:
                 goal = min(kill_cubes, key=lambda cube: distance(pos, cube["pos"]))["pos"][:2]
             elif threat_bearing is not None and (
-                disengage or (not opening and self.pvp and target is None and near_dist < 70)
+                (disengage and not (recovery_stalled and target is not None))
+                or (not opening and self.pvp and target is None and near_dist < 70)
             ):
                 away = threat_bearing + math.pi + 0.33 * self.weave_side(now)
                 goal = (pos[0] + 40 * math.cos(away), pos[1] + 40 * math.sin(away))
@@ -1046,7 +1084,8 @@ class Bot:
         if nearest and disengage and not urgent_zone and dodge is None:
             tx, ty, tz = nearest["pos"]
             cover_from = (tx, ty, tz + self.config["mech"]["muzzle_height"])
-        escaping = disengage and not (peek_plan or corner)
+        escaping = disengage and not (peek_plan or corner or fight_close
+                                       or (recovery_stalled and target is not None and recovery_route is None))
         self.move(me, goal, action, dodge, urgent_zone or (escaping and near_dist < 95),
                   quiet and dodge is None and not urgent_zone, cover_from if escaping else None)
         boost_route = ((developing and distance(pos, goal) > 9)
@@ -1055,6 +1094,8 @@ class Bot:
         if (boost_route and dodge is None and me["grounded"]
                 and math.hypot(*action.get("move", (0, 0))) > 0.25):
             action["boost"] = me["energy"] - me["stats"]["boost_drain"] * self.turn_step >= 30
+        if recovery_route is not None and dodge is None and "move" in action:
+            action["boost"] = me["energy"] >= me["stats"]["boost_drain"] * self.turn_step
 
         if threat_bearing is None:
             self.scan = math.remainder(self.scan + 0.055, math.tau)

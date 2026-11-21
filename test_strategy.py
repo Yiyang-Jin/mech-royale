@@ -455,6 +455,29 @@ class StrategyTests(unittest.TestCase):
         self.assertEqual(action["fire"], [False, False])
         roof.assert_not_called()
 
+    def test_stalled_recovery_boosts_to_cover_then_fights_a_close_pursuer(self):
+        bot = Bot(self.hello)
+        obs = deepcopy(self.replay[0])
+        x, y, z = obs["self"]["pos"]
+        obs["self"].update(hp=500, energy=60, grounded=True)
+        obs["zone"].update(center=[x, y], next_center=[x, y], radius=400, next_radius=320)
+        foe = {"id": 12, "kind": "mech", "pos": [x + 60, y, z], "hp": 1000, "aim": [0, 0]}
+        obs.update(t=95, drops=[], projectiles=[], beams=[], sounds=[], events=[], mechs=[foe])
+        with (patch.object(bot, "covered_for_recovery", return_value=False),
+              patch.object(bot, "recovery_cover", return_value=(x - 22, y)) as cover,
+              patch.object(bot.arena, "walkable", return_value=True)):
+            bot.act(obs)
+            cover.assert_not_called()
+            obs["t"] = 97.5
+            action = bot.act(obs)
+            self.assertTrue(action["boost"])
+            self.assertLess(action["move"][0], -0.9)
+            foe["pos"][0] = x + 40
+            action = bot.act(obs)
+            self.assertFalse(action["boost"])
+            self.assertGreater(abs(action["move"][1]), 0.9)
+            cover.assert_called_once()
+
     def test_drop_route_and_armor_pick_continue_when_aim_follows_sound(self):
         bot = Bot(self.hello)
         obs = deepcopy(self.replay[0])
