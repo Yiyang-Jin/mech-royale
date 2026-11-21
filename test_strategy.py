@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 
 from arena_geometry import Prism, RoofEntry
-from strategy_bot import Bot, PRACTICE, intercept
+from strategy_bot import Bot, PRACTICE, TurretRoof, intercept
 
 
 ROOT = Path(__file__).resolve().parent
@@ -489,6 +489,35 @@ class StrategyTests(unittest.TestCase):
             self.assertTrue(bot.act(obs)["fire"][1])
             obs["t"] = 91.8
             self.assertFalse(bot.act(obs)["fire"][1])
+
+    def test_turret_jumps_with_horizontal_speed_and_keeps_target_until_roof_rest(self):
+        bot = Bot(self.hello)
+        obs = deepcopy(self.replay[0])
+        x, y, z = obs["self"]["pos"]
+        me = obs["self"]
+        me.update(hp=720, energy=80, vel=[7, 0, 0], grounded=True)
+        obs["zone"].update(center=[x, y], next_center=[x, y], radius=400, next_radius=320)
+        enemy = {"id": 12, "kind": "mech", "pos": [x - 50, y, z], "hp": 1000, "aim": [0, 0]}
+        obs.update(t=95, drops=[], projectiles=[], beams=[], sounds=[], events=[], mechs=[enemy])
+        roof = TurretRoof((x, y), (x + 3.2, y), (-1, 0),
+                          (x + 5.2, y), (x + 11.2, y), z + 14)
+        with (patch.object(bot.arena, "ground", return_value=z),
+              patch.object(bot, "find_turret_roof", return_value=roof),
+              patch.object(bot, "attack") as attack):
+            action = bot.act(obs)
+            self.assertTrue(action["jump"])
+            self.assertTrue(action["boost"])
+            self.assertIs(attack.call_args.args[1], enemy)
+            me.update(pos=[x, y, z + 15], grounded=False)
+            obs["t"] = 96
+            self.assertGreater(bot.act(obs)["move"][0], 0.9)
+            me.update(pos=[x + 7, y, z + 14], grounded=True)
+            obs["t"] = 97
+            self.assertGreater(bot.act(obs)["move"][0], 0.9)
+            self.assertIsNone(attack.call_args.args[1])
+            me.update(hp=me["max_hp"], energy=100)
+            self.assertLess(bot.act(obs)["move"][0], 0)
+            self.assertIs(attack.call_args.args[1], enemy)
 
     def test_recorded_observations_without_wrapper_fallback(self):
         bot = Bot(self.hello)

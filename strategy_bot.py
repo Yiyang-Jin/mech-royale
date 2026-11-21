@@ -1,9 +1,10 @@
 """Mech Royale strategy for the mechfight/1 game protocol."""
 from dataclasses import dataclass
+from itertools import pairwise
 import math
 from time import perf_counter
 
-from arena_geometry import Arena
+from arena_geometry import Arena, cells
 import mechfight as mf
 
 
@@ -43,6 +44,24 @@ class Peek:
     began: float
     saw_charge: bool = False
     returning: bool = False
+
+
+@dataclass(frozen=True)
+class TurretRoof:
+    launch: tuple[float, float]
+    wall: tuple[float, float]
+    outward: tuple[float, float]
+    perch: tuple[float, float]
+    center: tuple[float, float]
+    top: float
+
+
+def segment_projection(point, a, b):
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    length = dx * dx + dy * dy
+    along = ((point[0] - a[0]) * dx + (point[1] - a[1]) * dy) / length if length else 0
+    along = max(0, min(1, along))
+    return a[0] + along * dx, a[1] + along * dy
 
 
 PRACTICE = Tactics(0.56, 0.88, 72, 115, 82, 29)
@@ -117,6 +136,12 @@ class Bot:
         self.roof_phase = "approach"
         self.roof_deadline = -math.inf
         self.roof_retry = -math.inf
+        self.turret_roof = None
+        self.turret_phase = "approach"
+        self.turret_resting = True
+        self.turret_deadline = -math.inf
+        self.turret_retry = -math.inf
+        self.turret_last_enemy = -math.inf
 
     def update_situation(self, obs, enemies):
         now = obs["t"]
@@ -532,6 +557,140 @@ class Bot:
             action["move"] = [math.cos(yaw), math.sin(yaw)]
         action["boost"] = not past_edge and not me["grounded"] and me["energy"] >= 2
         return True
+
+    def find_turret_roof(self, obs):
+        me = obs["self"]
+        x, y, z = me["pos"]
+        radius = me["stats"]["radius"]
+        launch_gap = max(3.2, radius + 0.45)
+        nearby = dict.fromkeys(p for cell in cells(x - 35, y - 35, x + 35, y + 35)
+                               for p in self.arena.bins.get(cell, ()))
+        walls = []
+        for prism in nearby:
+            if prism.kind not in ("building", "bridge") or not 8.5 <= prism.top - z <= 20:
+                continue
+            if min(prism.bounds[2] - prism.bounds[0], prism.bounds[3] - prism.bounds[1]) <= 12:
+                continue
+            for a, b in pairwise(prism.rings[0]):
+                length = distance(a, b)
+                if length <= 2 * radius:
+                    continue
+                wall = segment_projection((x, y), a, b)
+                if distance(a, wall) < radius or distance(b, wall) < radius:
+                    a, b = ((a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f)
+                            for f in (radius / length, 1 - radius / length))
+                    wall = segment_projection((x, y), a, b)
+                gap = distance((x, y), wall)
+                if gap <= 35:
+                    walls.append((gap, wall, prism, a, b))
+
+        for _, wall, prism, a, b in sorted(walls, key=lambda item: item[0])[:24]:
+            length = distance(a, b)
+            nx, ny = (a[1] - b[1]) / length, (b[0] - a[0]) / length
+            if prism.inside(wall[0] + nx, wall[1] + ny):
+                nx, ny = -nx, -ny
+            launch = (wall[0] + nx * launch_gap, wall[1] + ny * launch_gap)
+            ground = self.arena.ground(*launch)
+            if not 8.5 <= prism.top - ground <= 20:
+                continue
+            if any(self.arena.solid_between((px, py, ground + 0.25), (px, py, prism.top + me["stats"]["height"]))
+                   for px, py in ((launch[0] + dx * radius, launch[1] + dy * radius)
+                                  for dx, dy in ((0, 0), (nx, ny), (-nx, -ny), (-ny, nx), (ny, -nx)))):
+                continue
+            perch = (wall[0] - nx * 2, wall[1] - ny * 2)
+            for inset in (8, 12, 17):
+                center = (wall[0] - nx * inset, wall[1] - ny * inset)
+                if (not prism.inside(*center) or not prism.inside(*perch)
+                        or any(distance(center, segment_projection(center, u, v)) <= 6
+                               for ring in prism.rings for u, v in pairwise(ring))
+                        or any(not prism.inside(wall[0] - nx * d, wall[1] - ny * d)
+                               for d in range(2, inset))
+                        or any(distance(p, self.safe_destination(obs, p)) > 0.5
+                               for p in (launch, center, perch))
+                        or any(self.arena.solid_between((*launch, prism.top + h), (*center, prism.top + h))
+                               for h in (0.61, me["stats"]["height"]))):
+                    continue
+                return TurretRoof(launch, wall, (nx, ny), perch, center, prism.top)
+        return None
+
+    def roof_turret(self, obs, enemies, action, urgent_zone):
+        me, now = obs["self"], obs["t"]
+        x, y, z = me["pos"]
+        hp = me["hp"] / me["max_hp"]
+        roof = self.turret_roof
+        if urgent_zone or (roof and (
+            distance(roof.center, self.safe_destination(obs, roof.center)) > 0.5
+            or distance(roof.perch, self.safe_destination(obs, roof.perch)) > 0.5
+            or (self.turret_phase != "perch" and now > self.turret_deadline)
+            or (self.turret_phase == "perch" and z < roof.top - 0.7)
+        )):
+            self.turret_roof = None
+            return None
+        if roof is None:
+            if (not me["grounded"] or abs(z - self.arena.ground(x, y)) > me["stats"]["step_up"]
+                    or me["energy"] < 65 or now < self.turret_retry
+                    or (hp >= 0.62 and sum(distance((x, y), e["pos"]) <= 100 for e in enemies) < 2)):
+                return None
+            self.turret_retry = now + 2
+            roof = self.turret_roof = self.find_turret_roof(obs)
+            if roof is None:
+                return None
+            self.turret_phase = "approach"
+            self.turret_deadline = now + 8
+            self.turret_resting = True
+        nx, ny = roof.outward
+        dx, dy = x - roof.wall[0], y - roof.wall[1]
+        wall_gap = dx * nx + dy * ny
+        if self.turret_phase == "approach":
+            radius = me["stats"]["radius"]
+            if not me["grounded"] or not (radius <= wall_gap < max(3.8, radius + 1.05)
+                                          and abs(dx * ny - dy * nx) <= 1.7):
+                gap = distance((x, y), roof.launch)
+                if me["grounded"] and 0.05 < gap < 2:
+                    yaw = bearing((x, y), roof.launch)
+                    action["move"] = [math.cos(yaw), math.sin(yaw)]
+                else:
+                    self.move(me, roof.launch, action, None, False, False)
+                return "approach"
+            self.turret_phase = "climb"
+            self.turret_deadline = now + 3
+        if self.turret_phase == "climb" and z <= roof.top + 0.6:
+            if me["energy"] < 4 or (me["grounded"] and now > self.turret_deadline - 2.65):
+                self.turret_roof = None
+                return None
+            correction = max(-0.25, min(0.4, (distance(roof.wall, roof.launch) - wall_gap) * 0.4))
+            action.update(move=[nx * correction, ny * correction], jump=me["grounded"], boost=True)
+            return "climb"
+        if self.turret_phase in ("climb", "cross"):
+            if self.turret_phase == "climb":
+                self.turret_phase = "cross"
+                self.turret_deadline = now + 3
+            if not me["grounded"] or z < roof.top - 0.6:
+                if z < roof.top - 0.6:
+                    self.turret_roof = None
+                    return None
+                yaw = bearing((x, y), roof.center)
+                action.update(move=[math.cos(yaw), math.sin(yaw)], boost=wall_gap > -me["stats"]["radius"])
+                return "cross"
+            self.turret_phase = "perch"
+            self.turret_last_enemy = now
+        if hp < 0.65 or me["energy"] < 80:
+            self.turret_resting = True
+        elif hp >= 0.90 and self.turret_resting:
+            self.turret_resting = False
+            self.turret_last_enemy = now
+        if any(e["pos"][2] < roof.top for e in enemies):
+            self.turret_last_enemy = now
+        if not self.turret_resting and now - self.turret_last_enemy > 5:
+            self.turret_roof = None
+            return None
+        goal = roof.center if self.turret_resting else roof.perch
+        gap = distance((x, y), goal)
+        if gap > 0.8:
+            yaw = bearing((x, y), goal)
+            speed = min(1, gap / 3)
+            action["move"] = [math.cos(yaw) * speed, math.sin(yaw) * speed]
+        return "rest" if self.turret_resting else "perch"
 
     def weapon_order(self, radius):
         if radius <= 100:
@@ -1047,12 +1206,21 @@ class Bot:
             tx, ty, tz = nearest["pos"]
             cover_from = (tx, ty, tz + self.config["mech"]["muzzle_height"])
         escaping = disengage and not (peek_plan or corner)
-        self.move(me, goal, action, dodge, urgent_zone or (escaping and near_dist < 95),
-                  quiet and dodge is None and not urgent_zone, cover_from if escaping else None)
+        roof_task = self.roof_turret(obs, enemies, action, urgent_zone)
+        if not roof_task:
+            self.move(me, goal, action, dodge, urgent_zone or (escaping and near_dist < 95),
+                      quiet and dodge is None and not urgent_zone, cover_from if escaping else None)
+        else:
+            self.peek = peek_plan = None
+            self.peek_precharge = False
+            if roof_task == "rest":
+                target = None
+            elif target is None or target.get("kind") != "mech":
+                target = self.select_target(me, enemies)
         boost_route = ((developing and distance(pos, goal) > 9)
-                       or (execute and not urgent_zone and distance(pos, target["pos"]) > 50)
+                       or (execute and target is not None and not urgent_zone and distance(pos, target["pos"]) > 50)
                        or (supply is not None and supply[1] is None and distance(pos, goal) > 24))
-        if (boost_route and dodge is None and me["grounded"]
+        if (not roof_task and boost_route and dodge is None and me["grounded"]
                 and math.hypot(*action.get("move", (0, 0))) > 0.25):
             action["boost"] = me["energy"] - me["stats"]["boost_drain"] * self.turn_step >= 30
 
@@ -1068,7 +1236,7 @@ class Bot:
             look = threat_bearing
         action["aim"] = list(peek_plan[1]) if peek_plan else [look, 0.0]
         self.attack(me, target, action)
-        if (escaping or urgent_zone) and threat_bearing is not None:
+        if not roof_task and (escaping or urgent_zone) and threat_bearing is not None:
             shooter = next((e for e in enemies if e.get("charging") and distance(pos, e["pos"]) <= 200), None)
             front = bearing(pos, shooter["pos"]) if shooter else (
                 self.last_damage_bearing if recently_hit else threat_bearing
@@ -1082,7 +1250,7 @@ class Bot:
             action["reload"] = gun["ammo"] == 0 or (target is None and (near_dist > 65 or disengage))
         mode = "FFA" if self.pvp else "practice"
         recovering = self.recovering and now - self.last_combat >= me["stats"]["regen_delay"]
-        state = "healing" if recovering else "retreat" if escaping else "active"
+        state = roof_task or ("healing" if recovering else "retreat" if escaping else "active")
         mf.draw.label(f"{mode} | {state}")
         return action
 
